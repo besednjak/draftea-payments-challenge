@@ -223,7 +223,7 @@ func (s *Service) HandleCommand(ctx context.Context, env events.Envelope) (retEr
 		meta := events.Metadata{CorrelationID: cmd.PaymentID, CausationID: env.EventID}
 		_, err = s.executeWithRetry(ctx, cmd.WalletID, func(w *domainwallet.Wallet) error {
 			return w.Reserve(cmd.PaymentID, cmd.Amount, meta)
-		}, matchReservedEvent(cmd.PaymentID))
+		}, matchReservationOutcomeEvent(cmd.PaymentID))
 		return wrapPermanentDomainError(err)
 
 	case events.CommandCaptureFunds:
@@ -444,13 +444,20 @@ func wrapPermanentDomainError(err error) error {
 	return err
 }
 
-func matchReservedEvent(paymentID string) func(events.Envelope) bool {
+// matchReservationOutcomeEvent matches the persisted outcome (reserved or rejected) of a
+// ReserveFunds command so a duplicate command republishes the original decision.
+func matchReservationOutcomeEvent(paymentID string) func(events.Envelope) bool {
 	return func(env events.Envelope) bool {
-		if env.Type != events.EventFundsReserved {
+		switch env.Type {
+		case events.EventFundsReserved:
+			payload, err := events.DecodePayload[events.FundsReservedPayload](env)
+			return err == nil && payload.PaymentID == paymentID
+		case events.EventFundsReservationRejected:
+			payload, err := events.DecodePayload[events.FundsReservationRejectedPayload](env)
+			return err == nil && payload.PaymentID == paymentID
+		default:
 			return false
 		}
-		payload, err := events.DecodePayload[events.FundsReservedPayload](env)
-		return err == nil && payload.PaymentID == paymentID
 	}
 }
 

@@ -203,7 +203,30 @@ func (o *PaymentOrchestrator) InitiatePayment(ctx context.Context, req InitiateP
 	initiated.ClearUncommitted()
 	o.syncPaymentViewLogged(ctx, initiated, uncommitted[0].OccurredAt)
 
+	result := InitiatePaymentResult{
+		PaymentID:  initiated.ID(),
+		Status:     payment.StatusPending,
+		HTTPStatus: http.StatusAccepted,
+	}
+
+	// PaymentInitiated is durable from here on, so the Idempotency-Key is always completed
+	// (never deleted) using WithoutCancel; it can never stay stuck IN_PROGRESS for 24 hours.
+	completeIdempotency := func(response InitiatePaymentResult) {
+		if !idempotencyReserved {
+			return
+		}
+		encoded, err := json.Marshal(response)
+		if err != nil {
+			ports.LoggerFromContext(ctx, o.logger).Warn("marshal idempotency response failed", "error", err.Error())
+			return
+		}
+		if err := o.idempotency.Complete(cleanupCtx, req.UserID, req.IdempotencyKey, initiated.ID(), encoded); err != nil {
+			ports.LoggerFromContext(ctx, o.logger).Warn("complete idempotency key failed", "error", err.Error())
+		}
+	}
+
 	if err := o.publishPaymentEvents(ctx, initiated.ID(), uncommitted); err != nil {
+		completeIdempotency(result)
 		return InitiatePaymentResult{}, err
 	}
 
@@ -226,13 +249,8 @@ func (o *PaymentOrchestrator) InitiatePayment(ctx context.Context, req InitiateP
 			Amount:    initiated.Amount(),
 		},
 	); err != nil {
+		completeIdempotency(result)
 		return InitiatePaymentResult{}, err
-	}
-
-	result := InitiatePaymentResult{
-		PaymentID:  initiated.ID(),
-		Status:     payment.StatusPending,
-		HTTPStatus: http.StatusAccepted,
 	}
 
 	timer := time.NewTimer(o.syncReserveWait)
@@ -253,15 +271,7 @@ func (o *PaymentOrchestrator) InitiatePayment(ctx context.Context, req InitiateP
 	case <-ctx.Done():
 	}
 
-	// Use WithoutCancel so a client disconnect during the bounded wait never leaves
-	// the Idempotency-Key stuck in IN_PROGRESS for 24 hours.
-	if idempotencyReserved {
-		if encoded, err := json.Marshal(result); err == nil {
-			if compErr := o.idempotency.Complete(cleanupCtx, req.UserID, req.IdempotencyKey, initiated.ID(), encoded); compErr != nil {
-				ports.LoggerFromContext(ctx, o.logger).Warn("complete idempotency key failed", "error", compErr.Error())
-			}
-		}
-	}
+	completeIdempotency(result)
 
 	return result, nil
 }
@@ -325,6 +335,24 @@ func (o *PaymentOrchestrator) HandleWalletEvent(ctx context.Context, env events.
 		})
 		if err != nil {
 			return wrapPermanentDomainError(err)
+		}
+		if updated.Status() == payment.StatusRejected || updated.Status() == payment.StatusFailed {
+			// Defensive compensation: a late reservation for a closed payment must not leave orphaned held funds.
+			return o.publishCommand(
+				ctx,
+				events.TopicWalletsCommands,
+				updated.WalletID(),
+				events.CommandReleaseFunds,
+				events.AggregateTypeWallet,
+				updated.WalletID(),
+				updated.ID(),
+				env.EventID,
+				events.ReleaseFundsCommand{
+					PaymentID: updated.ID(),
+					WalletID:  updated.WalletID(),
+					Reason:    "ORPHAN_RESERVATION_COMPENSATION",
+				},
+			)
 		}
 		o.notifyWaiter(payload.PaymentID, reserveOutcome{reserved: true, availableAfter: payload.AvailableAfter})
 		if !transitioned && updated.Status() == payment.StatusFundsReserved {
@@ -487,7 +515,9 @@ func (o *PaymentOrchestrator) HandleGatewayEvent(ctx context.Context, env events
 		if err != nil {
 			return err
 		}
-		if loaded.Status().IsTerminal() || loaded.Status() == payment.StatusCompleted {
+		// A late or duplicate NotSent must never release funds once the payment progressed past
+		// FUNDS_RESERVED (SUBMITTED / GATEWAY_UNKNOWN may already be processed by the provider).
+		if loaded.Status() != payment.StatusFundsReserved {
 			return nil
 		}
 		ctx = ports.WithCorrelation(ctx, loaded.ID(), loaded.ID(), loaded.WalletID())

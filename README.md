@@ -88,6 +88,33 @@ DEMO_LOGS=1 go run ./cmd/demo
 
 ---
 
+## Implementado en Parte 2 vs Diseño de Producción
+
+La Parte 2 se acotó conscientemente al alcance de ~4 horas. Las invariantes financieras (saldo no negativo, nunca liberar sin evidencia negativa, reembolsos acotados a lo capturado) se respetan igual, pero algunas piezas de infraestructura se simplificaron respecto del diseño de [`docs/`](docs/):
+
+| Diseño de producción (Parte 1) | Implementación en Parte 2 |
+|---|---|
+| API HTTP (`POST /v1/payments`, `GET /healthz`, etc.) | Sin servidor HTTP: los casos de uso se invocan directamente desde `cmd/demo` y los tests (`HTTPStatus` modela la respuesta `202`/`422`) |
+| Transactional Outbox con worker de polling | *Publish-after-append* con **republish-on-retry**: si `Publish` falla después de `Append`, el reintento detecta el efecto ya persistido y republica el evento/comando |
+| Inbox `processed_messages` en PostgreSQL (misma transacción) | Inbox en memoria con **rollback** (`UnmarkProcessed`) si el handler falla |
+| Conciliación periódica (`1m, 5m, 15m…` hasta 24h) | Conciliación disparada explícitamente (`TriggerReconciliation`, `ExpireReconciliationWindow`), sin ticker de fondo |
+| Kafka con particiones por topic | Bus en memoria con **particiones compartidas** entre topics (mismo orden FIFO por clave) |
+| Recuperación de todos los consumidores por offset | Recovery enfocado en pagos: `RebuildAll` de read models + `RecoverActiveSagas` sobre streams `payment-*` |
+
+### Escenarios del enunciado → tests
+
+Todos en [`internal/application/saga/scenarios_test.go`](internal/application/saga/scenarios_test.go):
+
+| # | Escenario | Test |
+|---|---|---|
+| 1 | Ruta feliz (+ reembolsos) | `TestScenario1_HappyPathWebhookAndRefunds` |
+| 2 | Saldo insuficiente | `TestScenario2_InsufficientFundsImmediateRejection` |
+| 3 | Timeout de pasarela (conciliación, compensación, circuit breaker) | `TestScenario3_GatewayTimeoutReconciliationAndCircuitBreaker` |
+| 4 | Pagos concurrentes sin doble gasto | `TestScenario4_ConcurrentPaymentsNoDoubleSpend` |
+| 5 | Recuperación tras reinicio | `TestScenario5_SystemRecoveryRebuildAndResumeActiveSagas` |
+
+---
+
 ## Uso de IA
 
 Tanto el diseño arquitectónico como la implementación en Go y la revisión final del código se trabajaron iterativamente con asistentes de IA, debatiendo trade-offs y validando invariantes antes de consolidar cada bloque. Siguiendo las indicaciones del enunciado, el historial completo de conversación (diseño, implementación y revisión) se guarda en [`ai-history/`](ai-history/).

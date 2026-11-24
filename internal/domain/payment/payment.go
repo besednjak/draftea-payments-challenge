@@ -560,17 +560,17 @@ func (p *Payment) record(eventType, aggregateID string, payload any, meta events
 	return nil
 }
 
-func (p *Payment) ID() string              { return p.id }
-func (p *Payment) WalletID() string        { return p.walletID }
-func (p *Payment) UserID() string          { return p.userID }
-func (p *Payment) ServiceID() string       { return p.serviceID }
-func (p *Payment) Provider() string        { return p.provider }
-func (p *Payment) Amount() events.Money    { return p.amount }
-func (p *Payment) Status() Status          { return p.status }
-func (p *Payment) ProviderRef() string     { return p.providerRef }
-func (p *Payment) FailureReason() string   { return p.failureReason }
-func (p *Payment) CapturedAmount() int64   { return p.capturedAmount }
-func (p *Payment) RefundedTotal() int64    { return p.refundedTotal }
+func (p *Payment) ID() string                { return p.id }
+func (p *Payment) WalletID() string          { return p.walletID }
+func (p *Payment) UserID() string            { return p.userID }
+func (p *Payment) ServiceID() string         { return p.serviceID }
+func (p *Payment) Provider() string          { return p.provider }
+func (p *Payment) Amount() events.Money      { return p.amount }
+func (p *Payment) Status() Status            { return p.status }
+func (p *Payment) ProviderRef() string       { return p.providerRef }
+func (p *Payment) FailureReason() string     { return p.failureReason }
+func (p *Payment) CapturedAmount() int64     { return p.capturedAmount }
+func (p *Payment) RefundedTotal() int64      { return p.refundedTotal }
 func (p *Payment) PendingRefundTotal() int64 { return p.pendingRefundTotal }
 func (p *Payment) RefundableAmount() int64 {
 	return p.capturedAmount - p.refundedTotal - p.pendingRefundTotal

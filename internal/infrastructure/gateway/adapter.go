@@ -59,6 +59,12 @@ type Adapter struct {
 
 	webhookMu    sync.Mutex
 	seenWebhooks map[string]struct{}
+
+	// attemptedPayments/attemptedRefunds remember which IDs already went over the wire at
+	// least once, so a later retry blocked by the breaker or bulkhead never claims non-delivery.
+	attemptMu         sync.Mutex
+	attemptedPayments map[string]struct{}
+	attemptedRefunds  map[string]struct{}
 }
 
 // NewAdapter creates a Gateway Adapter ACL.
@@ -85,18 +91,20 @@ func NewAdapter(cfg AdapterConfig) *Adapter {
 	}
 
 	return &Adapter{
-		gatewayClient: cfg.Gateway,
-		publisher:     cfg.Publisher,
-		inbox:         cfg.Inbox,
-		breaker:       breaker,
-		retry:         cfg.Retry.withDefaults(),
-		bulkhead:      make(chan struct{}, limit),
-		webhookSecret: cfg.WebhookSecret,
-		logger:        logger,
-		metrics:       cfg.Metrics,
-		clock:         clock,
-		idGen:         idGen,
-		seenWebhooks:  make(map[string]struct{}),
+		gatewayClient:     cfg.Gateway,
+		publisher:         cfg.Publisher,
+		inbox:             cfg.Inbox,
+		breaker:           breaker,
+		retry:             cfg.Retry.withDefaults(),
+		bulkhead:          make(chan struct{}, limit),
+		webhookSecret:     cfg.WebhookSecret,
+		logger:            logger,
+		metrics:           cfg.Metrics,
+		clock:             clock,
+		idGen:             idGen,
+		seenWebhooks:      make(map[string]struct{}),
+		attemptedPayments: make(map[string]struct{}),
+		attemptedRefunds:  make(map[string]struct{}),
 	}
 }
 
@@ -209,6 +217,13 @@ func (a *Adapter) handleSubmitPayment(ctx context.Context, env events.Envelope) 
 	case a.bulkhead <- struct{}{}:
 		defer func() { <-a.bulkhead }()
 	default:
+		if a.paymentWasAttempted(cmd.PaymentID) {
+			return a.emit(ctx, events.EventGatewayOutcomeUnknown, cmd.PaymentID, events.GatewayOutcomeUnknownPayload{
+				PaymentID: cmd.PaymentID,
+				Provider:  cmd.Provider,
+				Reason:    "BULKHEAD_SATURATED",
+			}, meta)
+		}
 		return a.emit(ctx, events.EventGatewaySubmissionNotSent, cmd.PaymentID, events.GatewaySubmissionNotSentPayload{
 			PaymentID: cmd.PaymentID,
 			Provider:  cmd.Provider,
@@ -221,8 +236,8 @@ func (a *Adapter) handleSubmitPayment(ctx context.Context, env events.Envelope) 
 
 	for attempt := 0; attempt < a.retry.MaxAttempts; attempt++ {
 		if err := a.breaker.Allow(); err != nil {
-			if !sentAnyAttempt {
-				// Certainty of non-delivery: safe for the saga to release held funds.
+			if !sentAnyAttempt && !a.paymentWasAttempted(cmd.PaymentID) {
+				// Certainty of non-delivery (never sent in this or any previous delivery): safe to release funds.
 				return a.emit(ctx, events.EventGatewaySubmissionNotSent, cmd.PaymentID, events.GatewaySubmissionNotSentPayload{
 					PaymentID: cmd.PaymentID,
 					Provider:  cmd.Provider,
@@ -238,6 +253,7 @@ func (a *Adapter) handleSubmitPayment(ctx context.Context, env events.Envelope) 
 		}
 
 		sentAnyAttempt = true
+		a.markPaymentAttempted(cmd.PaymentID)
 		start := time.Now()
 		attemptCtx, cancel := context.WithTimeout(ctx, a.retry.AttemptTimeout)
 		result, callErr := a.gatewayClient.SubmitPayment(attemptCtx, ports.GatewaySubmitRequest{
@@ -387,36 +403,25 @@ func (a *Adapter) handleRefundPayment(ctx context.Context, env events.Envelope) 
 		CausationID:   env.EventID,
 	}
 
+	// Only an explicit provider rejection releases the in-flight refund reservation. Saturation,
+	// an open breaker, or a previous uncertain attempt return retryable errors instead.
 	select {
 	case a.bulkhead <- struct{}{}:
 		defer func() { <-a.bulkhead }()
 	default:
-		return a.emit(ctx, events.EventGatewayRefundDeclined, cmd.PaymentID, events.GatewayRefundDeclinedPayload{
-			PaymentID: cmd.PaymentID,
-			RefundID:  cmd.RefundID,
-			Provider:  cmd.Provider,
-			Reason:    "BULKHEAD_SATURATED",
-		}, meta)
+		return fmt.Errorf("refund %s not sent: bulkhead saturated (previously_attempted=%t)",
+			cmd.RefundID, a.refundWasAttempted(cmd.RefundID))
 	}
 
-	sentAnyAttempt := false
 	var lastErr error
 
 	for attempt := 0; attempt < a.retry.MaxAttempts; attempt++ {
 		if err := a.breaker.Allow(); err != nil {
-			if !sentAnyAttempt {
-				return a.emit(ctx, events.EventGatewayRefundDeclined, cmd.PaymentID, events.GatewayRefundDeclinedPayload{
-					PaymentID: cmd.PaymentID,
-					RefundID:  cmd.RefundID,
-					Provider:  cmd.Provider,
-					Reason:    events.ReasonCircuitOpen,
-				}, meta)
-			}
-			// A prior refund attempt already went over the wire: do not falsely mark as declined.
-			return fmt.Errorf("refund %s outcome uncertain after circuit opened: %w", cmd.RefundID, err)
+			return fmt.Errorf("refund %s blocked by open circuit (previously_attempted=%t): %w",
+				cmd.RefundID, a.refundWasAttempted(cmd.RefundID), err)
 		}
 
-		sentAnyAttempt = true
+		a.markRefundAttempted(cmd.RefundID)
 		start := time.Now()
 		attemptCtx, cancel := context.WithTimeout(ctx, a.retry.AttemptTimeout)
 		result, callErr := a.gatewayClient.RefundPayment(attemptCtx, ports.GatewayRefundRequest{
@@ -501,4 +506,30 @@ func (a *Adapter) recordAttempt(provider, outcome string, elapsed time.Duration)
 	if a.metrics != nil {
 		a.metrics.RecordGatewayAttempt(provider, outcome, elapsed)
 	}
+}
+
+func (a *Adapter) markPaymentAttempted(paymentID string) {
+	a.attemptMu.Lock()
+	a.attemptedPayments[paymentID] = struct{}{}
+	a.attemptMu.Unlock()
+}
+
+func (a *Adapter) paymentWasAttempted(paymentID string) bool {
+	a.attemptMu.Lock()
+	defer a.attemptMu.Unlock()
+	_, attempted := a.attemptedPayments[paymentID]
+	return attempted
+}
+
+func (a *Adapter) markRefundAttempted(refundID string) {
+	a.attemptMu.Lock()
+	a.attemptedRefunds[refundID] = struct{}{}
+	a.attemptMu.Unlock()
+}
+
+func (a *Adapter) refundWasAttempted(refundID string) bool {
+	a.attemptMu.Lock()
+	defer a.attemptMu.Unlock()
+	_, attempted := a.attemptedRefunds[refundID]
+	return attempted
 }

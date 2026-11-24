@@ -32,9 +32,9 @@ func (f *failingAppendStore) Append(ctx context.Context, streamID string, expect
 }
 
 type recordingPublisher struct {
-	mu               sync.Mutex
-	published        []events.Envelope
-	failNextPublish  atomic.Int32
+	mu              sync.Mutex
+	published       []events.Envelope
+	failNextPublish atomic.Int32
 }
 
 func (r *recordingPublisher) Publish(_ context.Context, _, _ string, env events.Envelope) error {

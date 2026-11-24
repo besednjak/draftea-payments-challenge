@@ -469,7 +469,7 @@ func TestAdapterHandleRefundPaymentResilience(t *testing.T) {
 		}
 	})
 
-	t.Run("open circuit emits GatewayRefundDeclined without calling gateway", func(t *testing.T) {
+	t.Run("open circuit returns retryable error without calling gateway or emitting decline", func(t *testing.T) {
 		breaker := gateway.NewCircuitBreaker(gateway.CircuitBreakerConfig{ConsecutiveTimeouts: 1})
 		breaker.RecordFailure(true)
 		mockGateway := gateway.NewMockGateway(gateway.MockBehavior{})
@@ -483,15 +483,14 @@ func TestAdapterHandleRefundPaymentResilience(t *testing.T) {
 
 		err := adapter.HandleCommand(context.Background(), mustRefundCommandEnvelope(t, "pay_1", "ref_cb_open"))
 
-		if err != nil {
-			t.Fatalf("HandleCommand failed: %v", err)
+		if !errors.Is(err, ports.ErrCircuitOpen) || ports.IsNonRetryable(err) {
+			t.Fatalf("expected retryable ErrCircuitOpen, got %v", err)
 		}
 		if mockGateway.RefundCalls("ref_cb_open") != 0 {
 			t.Fatalf("expected 0 calls when circuit open, got %d", mockGateway.RefundCalls("ref_cb_open"))
 		}
-		emitted := publisher.list()
-		if len(emitted) != 1 || emitted[0].Type != events.EventGatewayRefundDeclined {
-			t.Fatalf("expected GatewayRefundDeclined, got %+v", emitted)
+		if emitted := publisher.list(); len(emitted) != 0 {
+			t.Fatalf("open circuit must not emit GatewayRefundDeclined, got %+v", emitted)
 		}
 	})
 }

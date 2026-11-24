@@ -19,7 +19,7 @@ type stubHealthChecker struct {
 	err  error
 }
 
-func (s stubHealthChecker) Name() string              { return s.name }
+func (s stubHealthChecker) Name() string                { return s.name }
 func (s stubHealthChecker) Check(context.Context) error { return s.err }
 
 func TestMetricsCollectorChoreographyAndDeduplication(t *testing.T) {

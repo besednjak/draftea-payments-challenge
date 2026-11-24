@@ -1254,3 +1254,188 @@ func TestInitiatePaymentSyncWaitTimeoutAndContextCancellation(t *testing.T) {
 		}
 	})
 }
+
+func mustCommandEnvelope(t *testing.T, commandType, aggregateType, aggregateID, correlationID string, payload any) events.Envelope {
+	t.Helper()
+	env, err := events.NewEnvelope(commandType, aggregateType, aggregateID, 0, payload,
+		events.Metadata{CorrelationID: correlationID}, nil, nil)
+	if err != nil {
+		t.Fatalf("NewEnvelope(%s) failed: %v", commandType, err)
+	}
+	return env
+}
+
+func TestRegressionDuplicateSubmitWithOpenBreakerDoesNotReleaseSubmittedFunds(t *testing.T) {
+	ctx := context.Background()
+	sys := newTestSystem(t, gateway.MockBehavior{SubmitOutcome: ports.GatewayOutcomeAccepted}, nil, nil)
+	sys.mustCreateFundedWallet(t, "wal_c1", "usr_c1", 10000)
+	sys.mustInitiatePayment(t, saga.InitiatePaymentRequest{
+		PaymentID: "pay_c1", WalletID: "wal_c1", UserID: "usr_c1", ServiceID: "svc_1", Provider: "mockpay",
+		Amount: events.Money{Amount: 6000, Currency: "ARS"},
+	})
+	sys.drain(t)
+	if view, err := sys.orchestrator.GetPayment(ctx, "pay_c1"); err != nil || view.Status != string(payment.StatusSubmitted) {
+		t.Fatalf("expected SUBMITTED before duplicate submit, got %+v err=%v", view, err)
+	}
+	for i := 0; i < 5; i++ {
+		sys.breaker.RecordFailure(true)
+	}
+
+	// Duplicate SubmitPayment hits an open breaker, followed by a late NotSent on the same partition.
+	duplicateSubmit := mustCommandEnvelope(t, events.CommandSubmitPayment, events.AggregateTypeGateway, "pay_c1", "pay_c1",
+		events.SubmitPaymentCommand{PaymentID: "pay_c1", Provider: "mockpay", ServiceID: "svc_1", Amount: events.Money{Amount: 6000, Currency: "ARS"}})
+	lateNotSent := mustCommandEnvelope(t, events.EventGatewaySubmissionNotSent, events.AggregateTypeGateway, "pay_c1", "pay_c1",
+		events.GatewaySubmissionNotSentPayload{PaymentID: "pay_c1", Provider: "mockpay", Reason: events.ReasonCircuitOpen})
+	if err := sys.bus.Publish(ctx, events.TopicGatewayCommands, "pay_c1", duplicateSubmit); err != nil {
+		t.Fatalf("Publish duplicate submit failed: %v", err)
+	}
+	if err := sys.bus.Publish(ctx, events.TopicGatewayEvents, "pay_c1", lateNotSent); err != nil {
+		t.Fatalf("Publish late NotSent failed: %v", err)
+	}
+	sys.drain(t)
+
+	if calls := sys.mockGateway.SubmitCalls("pay_c1"); calls != 1 {
+		t.Fatalf("expected exactly 1 outbound submit, got %d", calls)
+	}
+	view, err := sys.orchestrator.GetPayment(ctx, "pay_c1")
+	if err != nil || view.Status != string(payment.StatusGatewayUnknown) {
+		t.Fatalf("expected GATEWAY_UNKNOWN (never FAILED), got %+v err=%v", view, err)
+	}
+	balance, err := sys.walletService.GetBalance(ctx, "wal_c1")
+	if err != nil || balance.Held != 6000 || balance.Available != 4000 {
+		t.Fatalf("funds must remain held for an already-submitted payment, got %+v err=%v", balance, err)
+	}
+}
+
+func TestRegressionRefundTimeoutThenOpenBreakerKeepsPendingRefund(t *testing.T) {
+	ctx := context.Background()
+	sys := newTestSystem(t, gateway.MockBehavior{
+		SubmitOutcome:       ports.GatewayOutcomeApproved,
+		RefundAlwaysTimeout: true,
+	}, nil, nil)
+	sys.mustCreateFundedWallet(t, "wal_c2", "usr_c2", 20000)
+	sys.mustInitiatePayment(t, saga.InitiatePaymentRequest{
+		PaymentID: "pay_c2", WalletID: "wal_c2", UserID: "usr_c2", ServiceID: "svc_1", Provider: "mockpay",
+		Amount: events.Money{Amount: 10000, Currency: "ARS"},
+	})
+	sys.drain(t)
+
+	var refundDeclined atomic.Int32
+	if err := sys.bus.Subscribe(events.TopicGatewayEvents, "refund-decline-probe", func(_ context.Context, env events.Envelope) error {
+		if env.Type == events.EventGatewayRefundDeclined {
+			refundDeclined.Add(1)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("Subscribe probe failed: %v", err)
+	}
+
+	if err := sys.orchestrator.RequestRefund(ctx, "pay_c2", "ref_c2", events.Money{Amount: 4000, Currency: "ARS"}); err != nil {
+		t.Fatalf("RequestRefund failed: %v", err)
+	}
+	sys.drain(t)
+
+	if sys.breaker.State() != gateway.StateOpen {
+		t.Fatalf("expected breaker OPEN after repeated refund timeouts, got %s", sys.breaker.State())
+	}
+	if refundDeclined.Load() != 0 {
+		t.Fatalf("timeouts or open breaker must never emit GatewayRefundDeclined, got %d", refundDeclined.Load())
+	}
+	loaded, err := sys.orchestrator.Load(ctx, "pay_c2")
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if !loaded.HasPendingRefund("ref_c2") || loaded.PendingRefundTotal() != 4000 || loaded.RefundedTotal() != 0 {
+		t.Fatalf("expected pending refund kept reserved, pending=%d refunded=%d", loaded.PendingRefundTotal(), loaded.RefundedTotal())
+	}
+	if balance, err := sys.walletService.GetBalance(ctx, "wal_c2"); err != nil || balance.Balance != 10000 {
+		t.Fatalf("wallet must not be credited on uncertain refund, got %+v err=%v", balance, err)
+	}
+	if dlqs := sys.bus.DeadLetters(events.TopicGatewayCommands); len(dlqs) != 1 {
+		t.Fatalf("expected uncertain refund parked in DLQ for redrive, got %d entries", len(dlqs))
+	}
+}
+
+func TestRegressionLateReserveAfterRejectionLeavesNoOrphanHold(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("duplicate ReserveFunds after rejection does not hold funds even after a top-up", func(t *testing.T) {
+		sys := newTestSystem(t, gateway.MockBehavior{SubmitOutcome: ports.GatewayOutcomeApproved}, nil, nil)
+		sys.mustCreateFundedWallet(t, "wal_m1", "usr_m1", 5000)
+		result := sys.mustInitiatePayment(t, saga.InitiatePaymentRequest{
+			PaymentID: "pay_m1", WalletID: "wal_m1", UserID: "usr_m1", ServiceID: "svc_1", Provider: "mockpay",
+			Amount: events.Money{Amount: 8000, Currency: "ARS"},
+		})
+		sys.drain(t)
+		if result.Status != payment.StatusRejected {
+			t.Fatalf("expected REJECTED, got %+v", result)
+		}
+		if _, err := sys.walletService.Deposit(ctx, "wal_m1", "dep_topup", events.Money{Amount: 10000, Currency: "ARS"}); err != nil {
+			t.Fatalf("top-up Deposit failed: %v", err)
+		}
+
+		duplicateReserve := mustCommandEnvelope(t, events.CommandReserveFunds, events.AggregateTypeWallet, "wal_m1", "pay_m1",
+			events.ReserveFundsCommand{PaymentID: "pay_m1", WalletID: "wal_m1", Amount: events.Money{Amount: 8000, Currency: "ARS"}})
+		if err := sys.bus.Publish(ctx, events.TopicWalletsCommands, "wal_m1", duplicateReserve); err != nil {
+			t.Fatalf("Publish duplicate reserve failed: %v", err)
+		}
+		sys.drain(t)
+
+		balance, err := sys.walletService.GetBalance(ctx, "wal_m1")
+		if err != nil || balance.Balance != 15000 || balance.Held != 0 || balance.Available != 15000 {
+			t.Fatalf("expected no orphaned hold, got %+v err=%v", balance, err)
+		}
+		if view, err := sys.orchestrator.GetPayment(ctx, "pay_m1"); err != nil || view.Status != string(payment.StatusRejected) {
+			t.Fatalf("expected payment to stay REJECTED, got %+v err=%v", view, err)
+		}
+		if calls := sys.mockGateway.SubmitCalls("pay_m1"); calls != 0 {
+			t.Fatalf("rejected payment must never reach the gateway, got %d calls", calls)
+		}
+	})
+
+	t.Run("late FundsReserved for a REJECTED payment triggers defensive ReleaseFunds", func(t *testing.T) {
+		sys := newTestSystem(t, gateway.MockBehavior{SubmitOutcome: ports.GatewayOutcomeApproved}, nil, nil)
+		sys.mustCreateFundedWallet(t, "wal_m1b", "usr_m1b", 10000)
+
+		rejectedPayment, err := payment.Initiate(payment.InitiateParams{
+			PaymentID: "pay_m1b", WalletID: "wal_m1b", UserID: "usr_m1b", ServiceID: "svc_1", Provider: "mockpay",
+			Amount: events.Money{Amount: 3000, Currency: "ARS"},
+		}, events.Metadata{})
+		if err != nil {
+			t.Fatalf("Initiate failed: %v", err)
+		}
+		if err := rejectedPayment.MarkRejected(events.ReasonInsufficientFunds, events.Metadata{}); err != nil {
+			t.Fatalf("MarkRejected failed: %v", err)
+		}
+		if err := sys.store.Append(ctx, rejectedPayment.StreamID(), 0, rejectedPayment.UncommittedEvents()...); err != nil {
+			t.Fatalf("append rejected payment failed: %v", err)
+		}
+
+		orphanWallet, err := sys.walletService.Load(ctx, "wal_m1b")
+		if err != nil {
+			t.Fatalf("Load wallet failed: %v", err)
+		}
+		if err := orphanWallet.Reserve("pay_m1b", events.Money{Amount: 3000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_m1b"}); err != nil {
+			t.Fatalf("seed orphan Reserve failed: %v", err)
+		}
+		orphanEvents := orphanWallet.UncommittedEvents()
+		if err := sys.store.Append(ctx, orphanWallet.StreamID(), orphanWallet.BaseVersion(), orphanEvents...); err != nil {
+			t.Fatalf("append orphan reservation failed: %v", err)
+		}
+		if err := sys.bus.Publish(ctx, events.TopicWalletsEvents, "wal_m1b", orphanEvents[0]); err != nil {
+			t.Fatalf("Publish late FundsReserved failed: %v", err)
+		}
+		sys.drain(t)
+
+		reloadedWallet, err := sys.walletService.Load(ctx, "wal_m1b")
+		if err != nil {
+			t.Fatalf("reload wallet failed: %v", err)
+		}
+		if reloadedWallet.Held() != 0 || reloadedWallet.Available() != 10000 {
+			t.Fatalf("expected orphaned hold to be compensated, held=%d available=%d", reloadedWallet.Held(), reloadedWallet.Available())
+		}
+		if loaded, err := sys.orchestrator.Load(ctx, "pay_m1b"); err != nil || loaded.Status() != payment.StatusRejected {
+			t.Fatalf("expected payment to stay REJECTED, got err=%v", err)
+		}
+	})
+}

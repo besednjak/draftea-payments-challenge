@@ -44,6 +44,7 @@ type Snapshot struct {
 	Released          map[string]bool  `json:"released,omitempty"`
 	Refunds           map[string]int64 `json:"refunds,omitempty"`
 	RefundedByPayment map[string]int64 `json:"refunded_by_payment,omitempty"`
+	RejectedPayments  map[string]bool  `json:"rejected_payments,omitempty"`
 }
 
 // Wallet is the Event-Sourced aggregate acting as the source of truth for a user's
@@ -63,6 +64,7 @@ type Wallet struct {
 	released          map[string]bool
 	refunds           map[string]int64
 	refundedByPayment map[string]int64
+	rejectedPayments  map[string]bool
 
 	uncommitted []events.Envelope
 	clock       events.Clock
@@ -77,6 +79,7 @@ func newEmpty(opts ...Option) *Wallet {
 		released:          make(map[string]bool),
 		refunds:           make(map[string]int64),
 		refundedByPayment: make(map[string]int64),
+		rejectedPayments:  make(map[string]bool),
 		clock:             events.DefaultClock,
 		idGen:             events.NewUUID,
 	}
@@ -133,6 +136,7 @@ func Rehydrate(snapshot *Snapshot, history []events.Envelope, opts ...Option) (*
 		maps.Copy(w.released, snapshot.Released)
 		maps.Copy(w.refunds, snapshot.Refunds)
 		maps.Copy(w.refundedByPayment, snapshot.RefundedByPayment)
+		maps.Copy(w.rejectedPayments, snapshot.RejectedPayments)
 	}
 
 	for _, env := range history {
@@ -202,6 +206,11 @@ func (w *Wallet) Reserve(paymentID string, amount events.Money, meta events.Meta
 		return nil
 	}
 	if w.released[paymentID] {
+		return nil
+	}
+	// A rejection is final for a paymentID: a late or duplicate ReserveFunds must not
+	// re-evaluate against a newer balance and create an orphaned hold.
+	if w.rejectedPayments[paymentID] {
 		return nil
 	}
 
@@ -398,9 +407,11 @@ func (w *Wallet) Apply(env events.Envelope) error {
 		w.reservations[payload.PaymentID] = payload.Amount.Amount
 
 	case events.EventFundsReservationRejected:
-		if _, err := events.DecodePayload[events.FundsReservationRejectedPayload](env); err != nil {
+		payload, err := events.DecodePayload[events.FundsReservationRejectedPayload](env)
+		if err != nil {
 			return err
 		}
+		w.rejectedPayments[payload.PaymentID] = true
 
 	case events.EventFundsCaptured:
 		payload, err := events.DecodePayload[events.FundsCapturedPayload](env)
@@ -474,6 +485,7 @@ func (w *Wallet) TakeSnapshot() Snapshot {
 		Released:          make(map[string]bool, len(w.released)),
 		Refunds:           make(map[string]int64, len(w.refunds)),
 		RefundedByPayment: make(map[string]int64, len(w.refundedByPayment)),
+		RejectedPayments:  make(map[string]bool, len(w.rejectedPayments)),
 	}
 	maps.Copy(snapshot.Deposits, w.deposits)
 	maps.Copy(snapshot.Reservations, w.reservations)
@@ -481,6 +493,7 @@ func (w *Wallet) TakeSnapshot() Snapshot {
 	maps.Copy(snapshot.Released, w.released)
 	maps.Copy(snapshot.Refunds, w.refunds)
 	maps.Copy(snapshot.RefundedByPayment, w.refundedByPayment)
+	maps.Copy(snapshot.RejectedPayments, w.rejectedPayments)
 	return snapshot
 }
 
