@@ -90,4 +90,4 @@ DEMO_LOGS=1 go run ./cmd/demo
 
 ## Uso de IA
 
-El diseño arquitectónico se trabajó iterativamente con un asistente de IA, debatiendo trade-offs antes de documentar. Siguiendo las indicaciones del enunciado, el historial de conversación se guarda en [`ai-history/`](ai-history/).
+Tanto el diseño arquitectónico como la implementación en Go y la revisión final del código se trabajaron iterativamente con asistentes de IA, debatiendo trade-offs y validando invariantes antes de consolidar cada bloque. Siguiendo las indicaciones del enunciado, el historial completo de conversación (diseño, implementación y revisión) se guarda en [`ai-history/`](ai-history/).
