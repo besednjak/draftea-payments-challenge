@@ -341,6 +341,110 @@ func TestScenario1_HappyPathWebhookAndRefunds(t *testing.T) {
 			t.Fatalf("expected 5 wallet transactions, got %d err=%v", len(history), err)
 		}
 	})
+
+	t.Run("concurrent partial refunds cannot exceed captured amount", func(t *testing.T) {
+		sys := newTestSystem(t, gateway.MockBehavior{SubmitOutcome: ports.GatewayOutcomeApproved}, nil, nil)
+		sys.mustCreateFundedWallet(t, "wal_cref", "usr_cref", 50000)
+
+		sys.mustInitiatePayment(t, saga.InitiatePaymentRequest{
+			PaymentID: "pay_cref_1",
+			WalletID:  "wal_cref",
+			UserID:    "usr_cref",
+			ServiceID: "svc_internet",
+			Provider:  "mockpay",
+			Amount:    events.Money{Amount: 10000, Currency: "ARS"},
+		})
+		sys.drain(t)
+
+		var (
+			wg        sync.WaitGroup
+			startCh   = make(chan struct{})
+			succeeded atomic.Int32
+			exceeded  atomic.Int32
+		)
+		for idx := 0; idx < 2; idx++ {
+			wg.Add(1)
+			go func(index int) {
+				defer wg.Done()
+				<-startCh
+				err := sys.orchestrator.RequestRefund(
+					ctx,
+					"pay_cref_1",
+					fmt.Sprintf("ref_conc_%d", index),
+					events.Money{Amount: 7000, Currency: "ARS"},
+				)
+				if err == nil {
+					succeeded.Add(1)
+					return
+				}
+				if errors.Is(err, payment.ErrRefundExceedsCaptured) {
+					exceeded.Add(1)
+					return
+				}
+				t.Errorf("unexpected RequestRefund[%d] error: %v", index, err)
+			}(idx)
+		}
+		close(startCh)
+		wg.Wait()
+		sys.drain(t)
+
+		if succeeded.Load() != 1 || exceeded.Load() != 1 {
+			t.Fatalf("expected 1 succeeded and 1 ErrRefundExceedsCaptured, got succeeded=%d exceeded=%d",
+				succeeded.Load(), exceeded.Load())
+		}
+
+		paymentView, err := sys.orchestrator.GetPayment(ctx, "pay_cref_1")
+		if err != nil {
+			t.Fatalf("GetPayment failed: %v", err)
+		}
+		balance, err := sys.walletService.GetBalance(ctx, "wal_cref")
+		if err != nil {
+			t.Fatalf("GetBalance failed: %v", err)
+		}
+		if paymentView.RefundedTotal != 7000 || balance.Balance != 47000 {
+			t.Fatalf("unexpected state after concurrent partial refunds: view=%+v balance=%+v", paymentView, balance)
+		}
+	})
+
+	t.Run("gateway refund decline releases pending reservation so retry succeeds", func(t *testing.T) {
+		sys := newTestSystem(t, gateway.MockBehavior{
+			SubmitOutcome:  ports.GatewayOutcomeApproved,
+			RefundDeclined: true,
+		}, nil, nil)
+		sys.mustCreateFundedWallet(t, "wal_rdec", "usr_rdec", 50000)
+
+		sys.mustInitiatePayment(t, saga.InitiatePaymentRequest{
+			PaymentID: "pay_rdec_1", WalletID: "wal_rdec", UserID: "usr_rdec", ServiceID: "svc_1", Provider: "mockpay",
+			Amount: events.Money{Amount: 10000, Currency: "ARS"},
+		})
+		sys.drain(t)
+
+		if err := sys.orchestrator.RequestRefund(ctx, "pay_rdec_1", "ref_declined_1", events.Money{Amount: 10000, Currency: "ARS"}); err != nil {
+			t.Fatalf("RequestRefund failed: %v", err)
+		}
+		sys.drain(t)
+
+		loaded, err := sys.orchestrator.Load(ctx, "pay_rdec_1")
+		if err != nil {
+			t.Fatalf("Load failed: %v", err)
+		}
+		if loaded.PendingRefundTotal() != 0 || loaded.RefundableAmount() != 10000 {
+			t.Fatalf("expected declined refund reservation released, pending=%d refundable=%d",
+				loaded.PendingRefundTotal(), loaded.RefundableAmount())
+		}
+
+		// Provider now approves a new refund request for the full amount.
+		sys.mockGateway.SetRule("pay_rdec_1", gateway.MockBehavior{SubmitOutcome: ports.GatewayOutcomeApproved, RefundDeclined: false})
+		if err := sys.orchestrator.RequestRefund(ctx, "pay_rdec_1", "ref_ok_2", events.Money{Amount: 10000, Currency: "ARS"}); err != nil {
+			t.Fatalf("retry RequestRefund failed: %v", err)
+		}
+		sys.drain(t)
+
+		finalView, err := sys.orchestrator.GetPayment(ctx, "pay_rdec_1")
+		if err != nil || finalView.Status != string(payment.StatusRefunded) {
+			t.Fatalf("expected REFUNDED after retry, got %+v err=%v", finalView, err)
+		}
+	})
 }
 
 func TestScenario2_InsufficientFundsImmediateRejection(t *testing.T) {
@@ -668,6 +772,9 @@ func TestScenario5_SystemRecoveryRebuildAndResumeActiveSagas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load wallet failed: %v", err)
 	}
+	if err := loadedWallet.Reserve("pay_stuck_pending", events.Money{Amount: 5000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_stuck_pending"}); err != nil {
+		t.Fatalf("seed reserve pay_stuck_pending failed: %v", err)
+	}
 	if err := loadedWallet.Reserve("pay_stuck_reserved", events.Money{Amount: 15000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_stuck_reserved"}); err != nil {
 		t.Fatalf("seed reserve pay_stuck_reserved failed: %v", err)
 	}
@@ -678,6 +785,18 @@ func TestScenario5_SystemRecoveryRebuildAndResumeActiveSagas(t *testing.T) {
 		t.Fatalf("append seeded wallet reservations failed: %v", err)
 	}
 
+	// Payment still PENDING even though Wallet already persisted FundsReserved before crash.
+	stuckPending, err := payment.Initiate(payment.InitiateParams{
+		PaymentID: "pay_stuck_pending", WalletID: "wal_rec", UserID: "usr_rec", ServiceID: "svc_0", Provider: "mockpay",
+		Amount: events.Money{Amount: 5000, Currency: "ARS"},
+	}, events.Metadata{})
+	if err != nil {
+		t.Fatalf("initiate stuckPending failed: %v", err)
+	}
+	if err := durableStore.Append(ctx, stuckPending.StreamID(), 0, stuckPending.UncommittedEvents()...); err != nil {
+		t.Fatalf("append stuckPending failed: %v", err)
+	}
+
 	stuckReserved, err := payment.Initiate(payment.InitiateParams{
 		PaymentID: "pay_stuck_reserved", WalletID: "wal_rec", UserID: "usr_rec", ServiceID: "svc_2", Provider: "mockpay",
 		Amount: events.Money{Amount: 15000, Currency: "ARS"},
@@ -685,7 +804,7 @@ func TestScenario5_SystemRecoveryRebuildAndResumeActiveSagas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("initiate stuckReserved failed: %v", err)
 	}
-	if err := stuckReserved.MarkFundsReserved(25000, events.Metadata{}); err != nil {
+	if err := stuckReserved.MarkFundsReserved(20000, events.Metadata{}); err != nil {
 		t.Fatalf("MarkFundsReserved stuckReserved failed: %v", err)
 	}
 	if err := durableStore.Append(ctx, stuckReserved.StreamID(), 0, stuckReserved.UncommittedEvents()...); err != nil {
@@ -699,7 +818,7 @@ func TestScenario5_SystemRecoveryRebuildAndResumeActiveSagas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("initiate stuckUnknown failed: %v", err)
 	}
-	if err := stuckUnknown.MarkFundsReserved(15000, events.Metadata{}); err != nil {
+	if err := stuckUnknown.MarkFundsReserved(10000, events.Metadata{}); err != nil {
 		t.Fatalf("MarkFundsReserved stuckUnknown failed: %v", err)
 	}
 	if err := stuckUnknown.MarkGatewayUnknown(events.ReasonGatewayTimeout, events.Metadata{}); err != nil {
@@ -730,7 +849,7 @@ func TestScenario5_SystemRecoveryRebuildAndResumeActiveSagas(t *testing.T) {
 	}
 
 	rebuiltBalance, err := recoveredInstance.balanceStore.Get(ctx, "wal_rec")
-	if err != nil || rebuiltBalance.Balance != 40000 || rebuiltBalance.Held != 25000 || rebuiltBalance.Available != 15000 {
+	if err != nil || rebuiltBalance.Balance != 40000 || rebuiltBalance.Held != 30000 || rebuiltBalance.Available != 10000 {
 		t.Fatalf("unexpected rebuilt balance before recovery: %+v err=%v", rebuiltBalance, err)
 	}
 
@@ -738,11 +857,15 @@ func TestScenario5_SystemRecoveryRebuildAndResumeActiveSagas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RecoverActiveSagas failed: %v", err)
 	}
-	if recoverySummary.Scanned != 3 || recoverySummary.Resumed != 2 {
-		t.Fatalf("expected 3 scanned and 2 resumed sagas, got %+v", recoverySummary)
+	if recoverySummary.Scanned != 4 || recoverySummary.Resumed != 3 {
+		t.Fatalf("expected 4 scanned and 3 resumed sagas, got %+v", recoverySummary)
 	}
 	recoveredInstance.drain(t)
 
+	pendingView, err := recoveredInstance.orchestrator.GetPayment(ctx, "pay_stuck_pending")
+	if err != nil || pendingView.Status != string(payment.StatusCompleted) {
+		t.Fatalf("expected pay_stuck_pending COMPLETED after Wallet republished FundsReserved, got %+v err=%v", pendingView, err)
+	}
 	reservedView, err := recoveredInstance.orchestrator.GetPayment(ctx, "pay_stuck_reserved")
 	if err != nil || reservedView.Status != string(payment.StatusCompleted) {
 		t.Fatalf("expected pay_stuck_reserved COMPLETED, got %+v err=%v", reservedView, err)
@@ -752,7 +875,7 @@ func TestScenario5_SystemRecoveryRebuildAndResumeActiveSagas(t *testing.T) {
 		t.Fatalf("expected pay_stuck_unknown FAILED, got %+v err=%v", unknownView, err)
 	}
 	finalBalance, err := recoveredInstance.walletService.GetBalance(ctx, "wal_rec")
-	if err != nil || finalBalance.Balance != 25000 || finalBalance.Held != 0 || finalBalance.Available != 25000 {
+	if err != nil || finalBalance.Balance != 20000 || finalBalance.Held != 0 || finalBalance.Available != 20000 {
 		t.Fatalf("unexpected final balance after recovery: %+v err=%v", finalBalance, err)
 	}
 
@@ -909,4 +1032,225 @@ func TestSagaPoisonPillRoutesDirectlyToDLQ(t *testing.T) {
 	if len(dlqs) != 1 || dlqs[0].Attempts != 1 {
 		t.Fatalf("expected poison pill in DLQ after 1 attempt, got %+v", dlqs)
 	}
+}
+
+type failOnceOnTopicPublisher struct {
+	delegate    ports.EventPublisher
+	targetTopic string
+	failedOnce  atomic.Bool
+}
+
+func (p *failOnceOnTopicPublisher) Publish(ctx context.Context, topic, partitionKey string, env events.Envelope) error {
+	if topic == p.targetTopic && p.failedOnce.CompareAndSwap(false, true) {
+		return errors.New("transient publish failure after append")
+	}
+	return p.delegate.Publish(ctx, topic, partitionKey, env)
+}
+
+func TestSagaRepublishesCommandAfterAppendThenPublishFailure(t *testing.T) {
+	ctx := context.Background()
+	store := eventstore.NewInMemoryEventStore()
+	inbox := eventstore.NewInMemoryInboxStore()
+	bus := eventbus.NewPartitionedBus(eventbus.Config{
+		Partitions:     2,
+		MaxAttempts:    3,
+		RetryBaseDelay: time.Millisecond,
+	})
+	defer func() { _ = bus.Close(ctx) }()
+
+	initiated, err := payment.Initiate(payment.InitiateParams{
+		PaymentID: "pay_pubfail_saga", WalletID: "wal_1", UserID: "usr_1", ServiceID: "svc_1", Provider: "mockpay",
+		Amount: events.Money{Amount: 3000, Currency: "ARS"},
+	}, events.Metadata{})
+	if err != nil {
+		t.Fatalf("Initiate failed: %v", err)
+	}
+	if err := store.Append(ctx, initiated.StreamID(), 0, initiated.UncommittedEvents()...); err != nil {
+		t.Fatalf("Append failed: %v", err)
+	}
+
+	// Attempt 1 appends PaymentFundsReserved, then fails publishing SubmitPayment to gateway.commands.v1.
+	flakyPub := &failOnceOnTopicPublisher{delegate: bus, targetTopic: events.TopicGatewayCommands}
+	orchestrator := saga.NewPaymentOrchestrator(saga.Config{
+		EventStore: store,
+		Publisher:  flakyPub,
+		Inbox:      inbox,
+	})
+	if err := bus.Subscribe(events.TopicWalletsEvents, "payment-saga", orchestrator.HandleWalletEvent); err != nil {
+		t.Fatalf("Subscribe wallet events failed: %v", err)
+	}
+
+	var (
+		cmdMu          sync.Mutex
+		submitCommands []events.Envelope
+	)
+	if err := bus.Subscribe(events.TopicGatewayCommands, "gateway-probe", func(_ context.Context, env events.Envelope) error {
+		cmdMu.Lock()
+		submitCommands = append(submitCommands, env)
+		cmdMu.Unlock()
+		return nil
+	}); err != nil {
+		t.Fatalf("Subscribe gateway commands failed: %v", err)
+	}
+
+	reservedEnv, err := events.NewEnvelope(
+		events.EventFundsReserved,
+		events.AggregateTypeWallet,
+		"wal_1",
+		2,
+		events.FundsReservedPayload{
+			PaymentID:      "pay_pubfail_saga",
+			Amount:         events.Money{Amount: 3000, Currency: "ARS"},
+			BalanceAfter:   10000,
+			HeldAfter:      3000,
+			AvailableAfter: 7000,
+		},
+		events.Metadata{CorrelationID: "pay_pubfail_saga"},
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("NewEnvelope failed: %v", err)
+	}
+
+	if err := bus.Publish(ctx, events.TopicWalletsEvents, "wal_1", reservedEnv); err != nil {
+		t.Fatalf("Publish failed: %v", err)
+	}
+	drainCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if err := bus.Drain(drainCtx); err != nil {
+		t.Fatalf("Drain failed: %v", err)
+	}
+
+	if dlqs := bus.DeadLetters(events.TopicWalletsEvents); len(dlqs) != 0 {
+		t.Fatalf("expected retry to recover after SubmitPayment publish failure, got DLQs: %+v", dlqs)
+	}
+	cmdMu.Lock()
+	defer cmdMu.Unlock()
+	if len(submitCommands) != 1 || submitCommands[0].Type != events.CommandSubmitPayment {
+		t.Fatalf("expected SubmitPayment emitted on retry, got %+v", submitCommands)
+	}
+}
+
+func TestInitiatePaymentSyncWaitTimeoutAndContextCancellation(t *testing.T) {
+	t.Run("SyncReserveWait expiration returns 202 PENDING while saga completes asynchronously", func(t *testing.T) {
+		ctx := context.Background()
+		store := eventstore.NewInMemoryEventStore()
+		bus := eventbus.NewPartitionedBus(eventbus.Config{Partitions: 2})
+		defer func() { _ = bus.Close(ctx) }()
+
+		balanceStore := readmodel.NewWalletBalanceStore()
+		paymentStore := readmodel.NewPaymentViewStore()
+		walletService := appwallet.NewService(appwallet.Config{
+			EventStore:       store,
+			BalanceReadModel: balanceStore,
+			Publisher:        bus,
+		})
+		if _, err := walletService.CreateWallet(ctx, "wal_slow", "usr_slow", "ARS"); err != nil {
+			t.Fatalf("CreateWallet failed: %v", err)
+		}
+		if _, err := walletService.Deposit(ctx, "wal_slow", "dep_1", events.Money{Amount: 10000, Currency: "ARS"}); err != nil {
+			t.Fatalf("Deposit failed: %v", err)
+		}
+
+		releaseWallet := make(chan struct{})
+		if err := bus.Subscribe(events.TopicWalletsCommands, "slow-wallet", func(hCtx context.Context, env events.Envelope) error {
+			<-releaseWallet
+			return walletService.HandleCommand(hCtx, env)
+		}); err != nil {
+			t.Fatalf("Subscribe failed: %v", err)
+		}
+
+		orchestrator := saga.NewPaymentOrchestrator(saga.Config{
+			EventStore:      store,
+			PaymentViews:    paymentStore,
+			Publisher:       bus,
+			SyncReserveWait: 15 * time.Millisecond,
+		})
+		if err := bus.Subscribe(events.TopicWalletsEvents, "payment-saga", orchestrator.HandleWalletEvent); err != nil {
+			t.Fatalf("Subscribe wallet events failed: %v", err)
+		}
+
+		res, err := orchestrator.InitiatePayment(ctx, saga.InitiatePaymentRequest{
+			PaymentID: "pay_slow_1", WalletID: "wal_slow", UserID: "usr_slow", ServiceID: "svc_1", Provider: "mockpay",
+			Amount: events.Money{Amount: 4000, Currency: "ARS"},
+		})
+		if err != nil {
+			t.Fatalf("InitiatePayment failed: %v", err)
+		}
+		if res.HTTPStatus != http.StatusAccepted || res.Status != payment.StatusPending {
+			t.Fatalf("expected 202 PENDING on wait expiry, got %+v", res)
+		}
+
+		close(releaseWallet)
+		drainCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		if err := bus.Drain(drainCtx); err != nil {
+			t.Fatalf("Drain failed: %v", err)
+		}
+
+		view, err := orchestrator.GetPayment(ctx, "pay_slow_1")
+		if err != nil || view.Status != string(payment.StatusFundsReserved) {
+			t.Fatalf("expected FUNDS_RESERVED asynchronously after unblock, got %+v err=%v", view, err)
+		}
+	})
+
+	t.Run("caller context cancellation during wait still completes Idempotency-Key", func(t *testing.T) {
+		baseCtx := context.Background()
+		store := eventstore.NewInMemoryEventStore()
+		idempotencyStore := eventstore.NewInMemoryIdempotencyStore(nil)
+		bus := eventbus.NewPartitionedBus(eventbus.Config{Partitions: 2})
+		defer func() { _ = bus.Close(baseCtx) }()
+
+		walletReached := make(chan struct{})
+		releaseWallet := make(chan struct{})
+		defer close(releaseWallet)
+
+		if err := bus.Subscribe(events.TopicWalletsCommands, "delayed-wallet", func(_ context.Context, _ events.Envelope) error {
+			close(walletReached)
+			<-releaseWallet
+			return nil
+		}); err != nil {
+			t.Fatalf("Subscribe failed: %v", err)
+		}
+
+		orchestrator := saga.NewPaymentOrchestrator(saga.Config{
+			EventStore:      store,
+			Publisher:       bus,
+			Idempotency:     idempotencyStore,
+			SyncReserveWait: 2 * time.Second,
+		})
+
+		reqCtx, cancelReq := context.WithCancel(baseCtx)
+		go func() {
+			<-walletReached
+			cancelReq()
+		}()
+
+		req := saga.InitiatePaymentRequest{
+			IdempotencyKey: "idem_cancel_1",
+			PaymentID:      "pay_cancel_1",
+			WalletID:       "wal_cancel",
+			UserID:         "usr_cancel",
+			ServiceID:      "svc_1",
+			Provider:       "mockpay",
+			Amount:         events.Money{Amount: 5000, Currency: "ARS"},
+		}
+		firstRes, err := orchestrator.InitiatePayment(reqCtx, req)
+		if err != nil {
+			t.Fatalf("InitiatePayment failed: %v", err)
+		}
+		if firstRes.HTTPStatus != http.StatusAccepted || firstRes.Status != payment.StatusPending {
+			t.Fatalf("expected 202 PENDING on caller cancel, got %+v", firstRes)
+		}
+
+		// Retrying with the same Idempotency-Key must return the cached result, NOT ErrIdempotencyInProgress.
+		retryRes, err := orchestrator.InitiatePayment(baseCtx, req)
+		if err != nil {
+			t.Fatalf("retry after caller cancellation failed (key may be stuck IN_PROGRESS): %v", err)
+		}
+		if !retryRes.FromIdempotencyCache || retryRes.PaymentID != firstRes.PaymentID {
+			t.Fatalf("expected cached response on retry, got %+v", retryRes)
+		}
+	})
 }

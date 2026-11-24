@@ -229,12 +229,56 @@ func TestPaymentPartialAndFullRefunds(t *testing.T) {
 		t.Fatalf("unexpected state after full refund: status=%s refundable=%d", pay.Status(), pay.RefundableAmount())
 	}
 
+	// Rehydrating preserves refunded total and terminal status.
 	rebuilt, err := payment.Rehydrate(pay.UncommittedEvents())
 	if err != nil {
 		t.Fatalf("Rehydrate after refunds failed: %v", err)
 	}
 	if rebuilt.Status() != payment.StatusRefunded || rebuilt.RefundedTotal() != 10000 {
 		t.Fatalf("rehydrated refund mismatch: status=%s refunded=%d", rebuilt.Status(), rebuilt.RefundedTotal())
+	}
+}
+
+func TestPaymentInFlightRefundReservationAndDecline(t *testing.T) {
+	pay := mustInitiatePayment(t, 10000)
+	meta := events.Metadata{CorrelationID: "pay_1"}
+	if err := pay.MarkFundsReserved(0, meta); err != nil {
+		t.Fatalf("MarkFundsReserved failed: %v", err)
+	}
+	if err := pay.MarkCompleted("prov_1", meta); err != nil {
+		t.Fatalf("MarkCompleted failed: %v", err)
+	}
+
+	if err := pay.RequestRefund("ref_1", events.Money{Amount: 7000, Currency: "ARS"}, meta); err != nil {
+		t.Fatalf("RequestRefund failed: %v", err)
+	}
+	if pay.PendingRefundTotal() != 7000 || pay.RefundableAmount() != 3000 || !pay.HasPendingRefund("ref_1") {
+		t.Fatalf("unexpected pending refund state: pending=%d refundable=%d", pay.PendingRefundTotal(), pay.RefundableAmount())
+	}
+
+	// Second concurrent refund exceeding remaining refundable (3000) must fail.
+	if err := pay.RequestRefund("ref_2", events.Money{Amount: 7000, Currency: "ARS"}, meta); !errors.Is(err, payment.ErrRefundExceedsCaptured) {
+		t.Fatalf("got %v, want ErrRefundExceedsCaptured", err)
+	}
+
+	// Explicit gateway decline frees the in-flight reservation.
+	if err := pay.DeclineRefund("ref_1", "REFUND_DECLINED", meta); err != nil {
+		t.Fatalf("DeclineRefund failed: %v", err)
+	}
+	if pay.PendingRefundTotal() != 0 || pay.RefundableAmount() != 10000 || pay.HasPendingRefund("ref_1") {
+		t.Fatalf("expected reservation released after decline: pending=%d refundable=%d", pay.PendingRefundTotal(), pay.RefundableAmount())
+	}
+
+	// Subsequent refund up to full captured amount succeeds and settles cleanly.
+	if err := pay.RequestRefund("ref_2", events.Money{Amount: 7000, Currency: "ARS"}, meta); err != nil {
+		t.Fatalf("RequestRefund ref_2 failed: %v", err)
+	}
+	if err := pay.RecordRefund("ref_2", events.Money{Amount: 7000, Currency: "ARS"}, meta); err != nil {
+		t.Fatalf("RecordRefund ref_2 failed: %v", err)
+	}
+	if pay.PendingRefundTotal() != 0 || pay.RefundedTotal() != 7000 || pay.RefundableAmount() != 3000 {
+		t.Fatalf("unexpected state after settling ref_2: pending=%d refunded=%d refundable=%d",
+			pay.PendingRefundTotal(), pay.RefundedTotal(), pay.RefundableAmount())
 	}
 }
 

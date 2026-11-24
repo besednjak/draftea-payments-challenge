@@ -57,6 +57,8 @@ const (
 	EventPaymentManualReviewRequired = "payment.PaymentManualReviewRequired"
 	EventPaymentCompleted            = "payment.PaymentCompleted"
 	EventPaymentFailed               = "payment.PaymentFailed"
+	EventPaymentRefundRequested      = "payment.PaymentRefundRequested"
+	EventPaymentRefundDeclined       = "payment.PaymentRefundDeclined"
 	EventPaymentRefunded             = "payment.PaymentRefunded"
 )
 
@@ -78,9 +80,10 @@ type ReserveFundsCommand struct {
 }
 
 type CaptureFundsCommand struct {
-	PaymentID string `json:"payment_id"`
-	WalletID  string `json:"wallet_id"`
-	Amount    Money  `json:"amount"`
+	PaymentID   string `json:"payment_id"`
+	WalletID    string `json:"wallet_id"`
+	ProviderRef string `json:"provider_ref,omitempty"`
+	Amount      Money  `json:"amount"`
 }
 
 type ReleaseFundsCommand struct {
@@ -148,6 +151,7 @@ type FundsReservationRejectedPayload struct {
 
 type FundsCapturedPayload struct {
 	PaymentID      string `json:"payment_id"`
+	ProviderRef    string `json:"provider_ref,omitempty"`
 	Amount         Money  `json:"amount"`
 	BalanceAfter   int64  `json:"balance_after"`
 	HeldAfter      int64  `json:"held_after"`
@@ -219,6 +223,18 @@ type PaymentCompletedPayload struct {
 
 type PaymentFailedPayload struct {
 	PaymentID string `json:"payment_id"`
+	Reason    string `json:"reason"`
+}
+
+type PaymentRefundRequestedPayload struct {
+	PaymentID string `json:"payment_id"`
+	RefundID  string `json:"refund_id"`
+	Amount    Money  `json:"amount"`
+}
+
+type PaymentRefundDeclinedPayload struct {
+	PaymentID string `json:"payment_id"`
+	RefundID  string `json:"refund_id"`
 	Reason    string `json:"reason"`
 }
 

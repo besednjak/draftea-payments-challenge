@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/besednjak/draftea-payments-challenge/internal/application/ports"
 	"github.com/besednjak/draftea-payments-challenge/internal/domain/events"
 	"github.com/besednjak/draftea-payments-challenge/internal/observability"
 )
@@ -21,14 +22,14 @@ type stubHealthChecker struct {
 func (s stubHealthChecker) Name() string              { return s.name }
 func (s stubHealthChecker) Check(context.Context) error { return s.err }
 
-func TestMetricsCollectorChoreographyAndSuccessRate(t *testing.T) {
+func TestMetricsCollectorChoreographyAndDeduplication(t *testing.T) {
 	collector := observability.NewCollector()
 	startTime := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
 
 	initiatedEnv, err := events.NewEnvelope(
 		events.EventPaymentInitiated, events.AggregateTypePayment, "pay_1", 1,
 		events.PaymentInitiatedPayload{PaymentID: "pay_1", Amount: events.Money{Amount: 5000, Currency: "ARS"}},
-		events.Metadata{OccurredAt: startTime}, nil, nil,
+		events.Metadata{EventID: "evt_init_1", OccurredAt: startTime}, nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("NewEnvelope initiated failed: %v", err)
@@ -36,7 +37,7 @@ func TestMetricsCollectorChoreographyAndSuccessRate(t *testing.T) {
 	completedEnv, err := events.NewEnvelope(
 		events.EventPaymentCompleted, events.AggregateTypePayment, "pay_1", 4,
 		events.PaymentCompletedPayload{PaymentID: "pay_1", CapturedAmount: 5000, Currency: "ARS"},
-		events.Metadata{OccurredAt: startTime.Add(150 * time.Millisecond)}, nil, nil,
+		events.Metadata{EventID: "evt_comp_1", OccurredAt: startTime.Add(150 * time.Millisecond)}, nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("NewEnvelope completed failed: %v", err)
@@ -44,7 +45,7 @@ func TestMetricsCollectorChoreographyAndSuccessRate(t *testing.T) {
 	walletRejectedEnv, err := events.NewEnvelope(
 		events.EventFundsReservationRejected, events.AggregateTypeWallet, "wal_1", 2,
 		events.FundsReservationRejectedPayload{PaymentID: "pay_2", Reason: events.ReasonInsufficientFunds},
-		events.Metadata{OccurredAt: startTime}, nil, nil,
+		events.Metadata{EventID: "evt_wrej_2", OccurredAt: startTime}, nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("NewEnvelope walletRejected failed: %v", err)
@@ -52,14 +53,15 @@ func TestMetricsCollectorChoreographyAndSuccessRate(t *testing.T) {
 	paymentRejectedEnv, err := events.NewEnvelope(
 		events.EventPaymentRejected, events.AggregateTypePayment, "pay_2", 2,
 		events.PaymentRejectedPayload{PaymentID: "pay_2", Reason: events.ReasonInsufficientFunds},
-		events.Metadata{OccurredAt: startTime.Add(50 * time.Millisecond)}, nil, nil,
+		events.Metadata{EventID: "evt_prej_2", OccurredAt: startTime.Add(50 * time.Millisecond)}, nil, nil,
 	)
 	if err != nil {
 		t.Fatalf("NewEnvelope paymentRejected failed: %v", err)
 	}
 
 	ctx := context.Background()
-	for _, env := range []events.Envelope{initiatedEnv, completedEnv, walletRejectedEnv, paymentRejectedEnv} {
+	// Deliver completedEnv twice to verify at-least-once deduplication by EventID.
+	for _, env := range []events.Envelope{initiatedEnv, completedEnv, completedEnv, walletRejectedEnv, paymentRejectedEnv} {
 		if err := collector.HandleEvent(ctx, env); err != nil {
 			t.Fatalf("HandleEvent failed: %v", err)
 		}
@@ -70,7 +72,7 @@ func TestMetricsCollectorChoreographyAndSuccessRate(t *testing.T) {
 	report := collector.Snapshot()
 
 	if report.PaymentsInitiated != 1 || report.PaymentsCompleted != 1 || report.PaymentsRejected != 1 {
-		t.Fatalf("unexpected counts: %+v", report)
+		t.Fatalf("unexpected counts (possible duplicate inflation): %+v", report)
 	}
 	if report.SuccessRate != 0.5 {
 		t.Fatalf("expected SuccessRate=0.5, got %v", report.SuccessRate)
@@ -113,9 +115,9 @@ func TestHealthRegistryReadiness(t *testing.T) {
 func TestStructuredLoggerCorrelation(t *testing.T) {
 	var output bytes.Buffer
 	baseLogger := observability.NewLogger(&output, slog.LevelInfo)
-	ctx := observability.WithCorrelation(context.Background(), "pay_42", "pay_42", "wal_9")
+	ctx := ports.WithCorrelation(context.Background(), "pay_42", "pay_42", "wal_9")
 
-	observability.LoggerFromContext(ctx, baseLogger).Info("payment completed")
+	ports.LoggerFromContext(ctx, baseLogger).Info("payment completed")
 
 	var parsed map[string]any
 	if err := json.Unmarshal(output.Bytes(), &parsed); err != nil {

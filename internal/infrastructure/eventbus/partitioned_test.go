@@ -250,12 +250,84 @@ func TestPartitionedBusCloseCancelsPendingRetryImmediately(t *testing.T) {
 	if elapsed > time.Second {
 		t.Fatalf("Close did not abort pending retry backoff promptly: elapsed=%v", elapsed)
 	}
+	// Give the cancelled worker a brief moment to finish unwinding before asserting.
+	time.Sleep(10 * time.Millisecond)
 	if attempts.Load() != 1 {
 		t.Fatalf("expected retry loop to exit after cancellation on attempt 1, got %d attempts", attempts.Load())
 	}
 	if dlqs := bus.DeadLetters(events.TopicGatewayCommands); len(dlqs) != 0 {
 		t.Fatalf("expected shutdown-interrupted message not to enter DLQ, got %+v", dlqs)
 	}
+}
+
+func TestPartitionedBusCloseCancelsInFlightHandlerAndRespectsDeadline(t *testing.T) {
+	t.Run("cancels handler context on Close deadline", func(t *testing.T) {
+		bus := eventbus.NewPartitionedBus(eventbus.Config{Partitions: 1})
+		handlerStarted := make(chan struct{})
+		handlerCancelled := make(chan struct{})
+
+		if err := bus.Subscribe(events.TopicWalletsCommands, "ctx-aware", func(ctx context.Context, _ events.Envelope) error {
+			close(handlerStarted)
+			<-ctx.Done()
+			close(handlerCancelled)
+			return ctx.Err()
+		}); err != nil {
+			t.Fatalf("Subscribe failed: %v", err)
+		}
+
+		env := mustMakeTestEnvelope(t, events.CommandReserveFunds, events.AggregateTypeWallet, "wal_ctx", 1)
+		if err := bus.Publish(context.Background(), events.TopicWalletsCommands, "wal_ctx", env); err != nil {
+			t.Fatalf("Publish failed: %v", err)
+		}
+		<-handlerStarted
+
+		closeCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		err := bus.Close(closeCtx)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected context.DeadlineExceeded, got %v", err)
+		}
+
+		select {
+		case <-handlerCancelled:
+		case <-time.After(time.Second):
+			t.Fatal("expected in-flight handler context to be cancelled on Close")
+		}
+	})
+
+	t.Run("does not block indefinitely if handler ignores cancellation", func(t *testing.T) {
+		bus := eventbus.NewPartitionedBus(eventbus.Config{Partitions: 1})
+		handlerStarted := make(chan struct{})
+		releaseHandler := make(chan struct{})
+		defer close(releaseHandler)
+
+		if err := bus.Subscribe(events.TopicWalletsCommands, "stuck-handler", func(_ context.Context, _ events.Envelope) error {
+			close(handlerStarted)
+			<-releaseHandler
+			return nil
+		}); err != nil {
+			t.Fatalf("Subscribe failed: %v", err)
+		}
+
+		env := mustMakeTestEnvelope(t, events.CommandReserveFunds, events.AggregateTypeWallet, "wal_stuck", 1)
+		if err := bus.Publish(context.Background(), events.TopicWalletsCommands, "wal_stuck", env); err != nil {
+			t.Fatalf("Publish failed: %v", err)
+		}
+		<-handlerStarted
+
+		closeCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		start := time.Now()
+		err := bus.Close(closeCtx)
+		elapsed := time.Since(start)
+
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected context.DeadlineExceeded, got %v", err)
+		}
+		if elapsed > 500*time.Millisecond {
+			t.Fatalf("Close blocked beyond deadline: elapsed=%v", elapsed)
+		}
+	})
 }
 
 func TestPartitionedBusDrainRespectsContextTimeout(t *testing.T) {

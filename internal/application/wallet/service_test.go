@@ -32,11 +32,15 @@ func (f *failingAppendStore) Append(ctx context.Context, streamID string, expect
 }
 
 type recordingPublisher struct {
-	mu        sync.Mutex
-	published []events.Envelope
+	mu               sync.Mutex
+	published        []events.Envelope
+	failNextPublish  atomic.Int32
 }
 
 func (r *recordingPublisher) Publish(_ context.Context, _, _ string, env events.Envelope) error {
+	if r.failNextPublish.Add(-1) >= 0 {
+		return errors.New("transient publish failure after append")
+	}
 	r.mu.Lock()
 	r.published = append(r.published, env)
 	r.mu.Unlock()
@@ -256,5 +260,75 @@ func TestWalletServicePoisonPillRoutesDirectlyToDLQ(t *testing.T) {
 	dlqs := bus.DeadLetters(events.TopicWalletsCommands)
 	if len(dlqs) != 1 || dlqs[0].Attempts != 1 {
 		t.Fatalf("expected poison pill in DLQ after 1 attempt, got %+v", dlqs)
+	}
+}
+
+func TestWalletServiceRepublishesAfterAppendThenPublishFailure(t *testing.T) {
+	ctx := context.Background()
+	store := eventstore.NewInMemoryEventStore()
+	recorder := &recordingPublisher{}
+	inbox := eventstore.NewInMemoryInboxStore()
+	balanceStore := readmodel.NewWalletBalanceStore()
+	bus := eventbus.NewPartitionedBus(eventbus.Config{
+		Partitions:     2,
+		MaxAttempts:    3,
+		RetryBaseDelay: time.Millisecond,
+	})
+	defer func() { _ = bus.Close(ctx) }()
+
+	walletService := appwallet.NewService(appwallet.Config{
+		EventStore:       store,
+		BalanceReadModel: balanceStore,
+		Publisher:        recorder,
+		Inbox:            inbox,
+	})
+	if _, err := walletService.CreateWallet(ctx, "wal_pubfail", "usr_1", "ARS"); err != nil {
+		t.Fatalf("CreateWallet failed: %v", err)
+	}
+	if _, err := walletService.Deposit(ctx, "wal_pubfail", "dep_1", events.Money{Amount: 5000, Currency: "ARS"}); err != nil {
+		t.Fatalf("Deposit failed: %v", err)
+	}
+	if err := bus.Subscribe(events.TopicWalletsCommands, "wallet-service", walletService.HandleCommand); err != nil {
+		t.Fatalf("Subscribe failed: %v", err)
+	}
+
+	// Attempt 1 appends FundsReserved cleanly, then fails during Publish.
+	// Attempt 2 sees the already-persisted reservation and must republish FundsReserved.
+	publishedBefore := len(recorder.list())
+	recorder.failNextPublish.Store(1)
+
+	reserveCmd, err := events.NewEnvelope(
+		events.CommandReserveFunds,
+		events.AggregateTypeWallet,
+		"wal_pubfail",
+		0,
+		events.ReserveFundsCommand{
+			PaymentID: "pay_pubfail",
+			WalletID:  "wal_pubfail",
+			Amount:    events.Money{Amount: 2000, Currency: "ARS"},
+		},
+		events.Metadata{CorrelationID: "pay_pubfail"},
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("NewEnvelope failed: %v", err)
+	}
+
+	if err := bus.Publish(ctx, events.TopicWalletsCommands, "wal_pubfail", reserveCmd); err != nil {
+		t.Fatalf("Publish failed: %v", err)
+	}
+	drainCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if err := bus.Drain(drainCtx); err != nil {
+		t.Fatalf("Drain failed: %v", err)
+	}
+
+	if dlqs := bus.DeadLetters(events.TopicWalletsCommands); len(dlqs) != 0 {
+		t.Fatalf("expected retry after Publish failure to recover cleanly, got DLQs: %+v", dlqs)
+	}
+	emitted := recorder.list()[publishedBefore:]
+	if len(emitted) != 1 || emitted[0].Type != events.EventFundsReserved {
+		t.Fatalf("expected persisted FundsReserved to be republished on retry, got %+v", emitted)
 	}
 }

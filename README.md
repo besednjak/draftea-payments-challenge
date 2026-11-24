@@ -70,7 +70,7 @@ Organizada siguiendo los 6 entregables del enunciado:
 
 ## Cómo ejecutar
 
-**Requisitos:** Go 1.25.2+ (sin dependencias externas; solo librería estándar).
+**Requisitos:** Go 1.22+ (sin dependencias externas; solo librería estándar).
 
 ```bash
 # Análisis estático

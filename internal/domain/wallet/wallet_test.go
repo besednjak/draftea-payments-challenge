@@ -3,6 +3,7 @@ package wallet_test
 import (
 	"errors"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -85,7 +86,7 @@ func TestWalletReserveAndCaptureHappyPath(t *testing.T) {
 		t.Fatalf("duplicate Reserve altered state: version=%d held=%d", fundedWallet.Version(), fundedWallet.Held())
 	}
 
-	if err := fundedWallet.Capture("pay_1", events.Money{Amount: 4000, Currency: "ARS"}, meta); err != nil {
+	if err := fundedWallet.Capture("pay_1", "prov_1", events.Money{Amount: 4000, Currency: "ARS"}, meta); err != nil {
 		t.Fatalf("Capture failed: %v", err)
 	}
 	if fundedWallet.Balance() != 6000 || fundedWallet.Held() != 0 || fundedWallet.Available() != 6000 {
@@ -96,7 +97,7 @@ func TestWalletReserveAndCaptureHappyPath(t *testing.T) {
 		t.Fatal("expected reservation to be cleared after capture")
 	}
 
-	if err := fundedWallet.Capture("pay_1", events.Money{Amount: 4000, Currency: "ARS"}, meta); err != nil {
+	if err := fundedWallet.Capture("pay_1", "prov_1", events.Money{Amount: 4000, Currency: "ARS"}, meta); err != nil {
 		t.Fatalf("duplicate Capture failed: %v", err)
 	}
 	if fundedWallet.Version() != 4 || fundedWallet.Balance() != 6000 {
@@ -186,19 +187,19 @@ func TestWalletCaptureErrorsAndCannotReleaseCaptured(t *testing.T) {
 	fundedWallet := mustCreateFundedWallet(t, 10000)
 	meta := events.Metadata{CorrelationID: "pay_1"}
 
-	if err := fundedWallet.Capture("pay_missing", events.Money{Amount: 100, Currency: "ARS"}, meta); !errors.Is(err, wallet.ErrReservationNotFound) {
+	if err := fundedWallet.Capture("pay_missing", "", events.Money{Amount: 100, Currency: "ARS"}, meta); !errors.Is(err, wallet.ErrReservationNotFound) {
 		t.Fatalf("got %v, want ErrReservationNotFound", err)
 	}
 	if err := fundedWallet.Reserve("pay_1", events.Money{Amount: 2000, Currency: "ARS"}, meta); err != nil {
 		t.Fatalf("Reserve failed: %v", err)
 	}
-	if err := fundedWallet.Capture("pay_1", events.Money{Amount: 1500, Currency: "ARS"}, meta); !errors.Is(err, wallet.ErrCaptureAmountMismatch) {
+	if err := fundedWallet.Capture("pay_1", "", events.Money{Amount: 1500, Currency: "ARS"}, meta); !errors.Is(err, wallet.ErrCaptureAmountMismatch) {
 		t.Fatalf("got %v, want ErrCaptureAmountMismatch", err)
 	}
-	if err := fundedWallet.Capture("pay_1", events.Money{Amount: 2000, Currency: "USD"}, meta); !errors.Is(err, wallet.ErrCurrencyMismatch) {
+	if err := fundedWallet.Capture("pay_1", "", events.Money{Amount: 2000, Currency: "USD"}, meta); !errors.Is(err, wallet.ErrCurrencyMismatch) {
 		t.Fatalf("got %v, want ErrCurrencyMismatch", err)
 	}
-	if err := fundedWallet.Capture("pay_1", events.Money{Amount: 2000, Currency: "ARS"}, meta); err != nil {
+	if err := fundedWallet.Capture("pay_1", "prov_1", events.Money{Amount: 2000, Currency: "ARS"}, meta); err != nil {
 		t.Fatalf("Capture failed: %v", err)
 	}
 	if err := fundedWallet.Release("pay_1", "too_late", meta); !errors.Is(err, wallet.ErrReservationAlreadyCaptured) {
@@ -206,7 +207,7 @@ func TestWalletCaptureErrorsAndCannotReleaseCaptured(t *testing.T) {
 	}
 }
 
-func TestWalletRefundAndDepositIdempotency(t *testing.T) {
+func TestWalletRefundInvariantsAndDepositIdempotency(t *testing.T) {
 	fundedWallet := mustCreateFundedWallet(t, 10000)
 	initialVersion := fundedWallet.Version()
 
@@ -217,19 +218,55 @@ func TestWalletRefundAndDepositIdempotency(t *testing.T) {
 		t.Fatalf("duplicate Deposit altered state: balance=%d version=%d", fundedWallet.Balance(), fundedWallet.Version())
 	}
 
-	if err := fundedWallet.Refund("pay_1", "ref_1", events.Money{Amount: 2500, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_1"}); err != nil {
-		t.Fatalf("Refund failed: %v", err)
-	}
-	if fundedWallet.Balance() != 12500 {
-		t.Fatalf("expected balance=12500, got %d", fundedWallet.Balance())
+	// Refunding an uncaptured payment must fail.
+	if err := fundedWallet.Refund("pay_uncaptured", "ref_0", events.Money{Amount: 1000, Currency: "ARS"}, events.Metadata{}); !errors.Is(err, wallet.ErrPaymentNotCaptured) {
+		t.Fatalf("got %v, want ErrPaymentNotCaptured", err)
 	}
 
+	// Capture 4000 so refunds up to 4000 are permitted.
+	meta := events.Metadata{CorrelationID: "pay_1"}
+	if err := fundedWallet.Reserve("pay_1", events.Money{Amount: 4000, Currency: "ARS"}, meta); err != nil {
+		t.Fatalf("Reserve failed: %v", err)
+	}
+	if err := fundedWallet.Capture("pay_1", "prov_1", events.Money{Amount: 4000, Currency: "ARS"}, meta); err != nil {
+		t.Fatalf("Capture failed: %v", err)
+	}
+
+	if err := fundedWallet.Refund("pay_1", "ref_1", events.Money{Amount: 2500, Currency: "ARS"}, meta); err != nil {
+		t.Fatalf("Refund failed: %v", err)
+	}
+	if fundedWallet.Balance() != 8500 {
+		t.Fatalf("expected balance=8500, got %d", fundedWallet.Balance())
+	}
+
+	// Duplicate refundID is an idempotent no-op.
 	versionAfterRefund := fundedWallet.Version()
-	if err := fundedWallet.Refund("pay_1", "ref_1", events.Money{Amount: 2500, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_1"}); err != nil {
+	if err := fundedWallet.Refund("pay_1", "ref_1", events.Money{Amount: 2500, Currency: "ARS"}, meta); err != nil {
 		t.Fatalf("duplicate Refund failed: %v", err)
 	}
-	if fundedWallet.Balance() != 12500 || fundedWallet.Version() != versionAfterRefund {
+	if fundedWallet.Balance() != 8500 || fundedWallet.Version() != versionAfterRefund {
 		t.Fatalf("duplicate Refund altered state: balance=%d version=%d", fundedWallet.Balance(), fundedWallet.Version())
+	}
+
+	// Cumulative refunds cannot exceed captured amount (2500 + 1501 > 4000).
+	if err := fundedWallet.Refund("pay_1", "ref_excess", events.Money{Amount: 1501, Currency: "ARS"}, meta); !errors.Is(err, wallet.ErrRefundExceedsCaptured) {
+		t.Fatalf("got %v, want ErrRefundExceedsCaptured", err)
+	}
+
+	// Exact remaining amount (1500) succeeds.
+	if err := fundedWallet.Refund("pay_1", "ref_2", events.Money{Amount: 1500, Currency: "ARS"}, meta); err != nil {
+		t.Fatalf("remaining Refund failed: %v", err)
+	}
+	if fundedWallet.Balance() != 10000 {
+		t.Fatalf("expected balance=10000, got %d", fundedWallet.Balance())
+	}
+}
+
+func TestWalletDepositAndRefundOverflowProtection(t *testing.T) {
+	fundedWallet := mustCreateFundedWallet(t, math.MaxInt64-100)
+
+	if err := fundedWallet.Deposit("dep_overflow", events.Money{Amount: 101, Currency: "ARS"}, events.Metadata{}); !errors.Is(err, wallet.ErrAmountOverflow) {
+		t.Fatalf("expected ErrAmountOverflow on deposit, got %v", err)
 	}
 }
 
@@ -240,14 +277,14 @@ func TestWalletRehydrateFromHistoryAndSnapshot(t *testing.T) {
 	}
 	snapshot := fundedWallet.TakeSnapshot()
 
-	// Mutating the snapshot maps must never leak back into the live aggregate.
+	// Mutating snapshot maps must never leak back into the live aggregate.
 	snapshot.Reservations["pay_fake"] = 999
 	if _, leaked := fundedWallet.HasReservation("pay_fake"); leaked {
 		t.Fatal("snapshot mutation leaked into aggregate")
 	}
 	delete(snapshot.Reservations, "pay_fake")
 
-	if err := fundedWallet.Capture("pay_1", events.Money{Amount: 3000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_1"}); err != nil {
+	if err := fundedWallet.Capture("pay_1", "prov_1", events.Money{Amount: 3000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_1"}); err != nil {
 		t.Fatalf("Capture failed: %v", err)
 	}
 	if err := fundedWallet.Reserve("pay_2", events.Money{Amount: 2000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_2"}); err != nil {
@@ -278,6 +315,16 @@ func TestWalletRehydrateFromHistoryAndSnapshot(t *testing.T) {
 	}
 	if reservedAmount, ok := fromSnapshot.HasReservation("pay_2"); !ok || reservedAmount != 2000 {
 		t.Fatalf("expected active reservation pay_2=2000, got (%d, %v)", reservedAmount, ok)
+	}
+
+	// Verify RefundedByPayment survives snapshot round-trip.
+	postRefundSnapshot := fundedWallet.TakeSnapshot()
+	rebuiltAfterRefund, err := wallet.Rehydrate(&postRefundSnapshot, nil)
+	if err != nil {
+		t.Fatalf("Rehydrate from post-refund snapshot failed: %v", err)
+	}
+	if err := rebuiltAfterRefund.Refund("pay_1", "ref_over", events.Money{Amount: 2501, Currency: "ARS"}, events.Metadata{}); !errors.Is(err, wallet.ErrRefundExceedsCaptured) {
+		t.Fatalf("expected ErrRefundExceedsCaptured after snapshot rehydrate, got %v", err)
 	}
 }
 

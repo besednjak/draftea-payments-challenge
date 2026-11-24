@@ -33,10 +33,11 @@ type MetricsReport struct {
 	MaxPaymentLatency      time.Duration     `json:"max_payment_latency"`
 }
 
-// Collector implements ports.MetricsRecorder and acts as the choreographed Metrics
-// Service consumer reacting to domain events without blocking the payment path.
+// Collector implements ports.MetricsRecorder for operational telemetry and acts as
+// the choreographed Metrics Service consumer reacting to domain events.
 type Collector struct {
 	mu                     sync.RWMutex
+	seenEvents             map[string]struct{}
 	paymentsInitiated      int64
 	paymentsCompleted      int64
 	paymentsFailed         int64
@@ -60,6 +61,7 @@ type Collector struct {
 // NewCollector initializes a thread-safe Metrics Collector.
 func NewCollector() *Collector {
 	return &Collector{
+		seenEvents:            make(map[string]struct{}),
 		volumeByCurrency:      make(map[string]int64),
 		refundedByCurrency:    make(map[string]int64),
 		gatewayAttempts:       make(map[string]int64),
@@ -71,8 +73,26 @@ func NewCollector() *Collector {
 }
 
 // HandleEvent consumes domain events from payments.events.v1, wallets.events.v1,
-// and gateway.events.v1 in a choreographed fashion.
-func (c *Collector) HandleEvent(_ context.Context, env events.Envelope) error {
+// and gateway.events.v1 in a choreographed fashion, deduplicating by EventID.
+func (c *Collector) HandleEvent(_ context.Context, env events.Envelope) (retErr error) {
+	if env.EventID != "" {
+		c.mu.Lock()
+		if _, duplicate := c.seenEvents[env.EventID]; duplicate {
+			c.mu.Unlock()
+			return nil
+		}
+		c.seenEvents[env.EventID] = struct{}{}
+		c.mu.Unlock()
+
+		defer func() {
+			if retErr != nil {
+				c.mu.Lock()
+				delete(c.seenEvents, env.EventID)
+				c.mu.Unlock()
+			}
+		}()
+	}
+
 	switch env.Type {
 	case events.EventPaymentInitiated:
 		c.mu.Lock()
@@ -85,15 +105,15 @@ func (c *Collector) HandleEvent(_ context.Context, env events.Envelope) error {
 		if err != nil {
 			return ports.NonRetryable(err)
 		}
-		c.RecordPaymentOutcome(string(payment.StatusCompleted), payload.CapturedAmount, payload.Currency)
+		c.recordPaymentOutcome(payment.StatusCompleted, payload.CapturedAmount, payload.Currency)
 		c.observeEndToEndLatency(env.AggregateID, env.OccurredAt)
 
 	case events.EventPaymentFailed:
-		c.RecordPaymentOutcome(string(payment.StatusFailed), 0, "")
+		c.recordPaymentOutcome(payment.StatusFailed, 0, "")
 		c.observeEndToEndLatency(env.AggregateID, env.OccurredAt)
 
 	case events.EventPaymentRejected:
-		c.RecordPaymentOutcome(string(payment.StatusRejected), 0, "")
+		c.recordPaymentOutcome(payment.StatusRejected, 0, "")
 		c.observeEndToEndLatency(env.AggregateID, env.OccurredAt)
 
 	case events.EventPaymentGatewayUnknown:
@@ -111,7 +131,7 @@ func (c *Collector) HandleEvent(_ context.Context, env events.Envelope) error {
 		if err != nil {
 			return ports.NonRetryable(err)
 		}
-		c.RecordRefund(payload.Amount.Amount, payload.Amount.Currency)
+		c.recordRefund(payload.Amount.Amount, payload.Amount.Currency)
 
 	case events.EventFundsReservationRejected:
 		payload, err := events.DecodePayload[events.FundsReservationRejectedPayload](env)
@@ -119,7 +139,7 @@ func (c *Collector) HandleEvent(_ context.Context, env events.Envelope) error {
 			return ports.NonRetryable(err)
 		}
 		if payload.Reason == events.ReasonInsufficientFunds {
-			c.RecordInsufficientFunds(env.AggregateID)
+			c.recordInsufficientFunds()
 		}
 	}
 	return nil
@@ -134,15 +154,15 @@ func (c *Collector) observeEndToEndLatency(paymentID string, finishedAt time.Tim
 	c.mu.Unlock()
 
 	if exists && !finishedAt.Before(startedAt) {
-		c.RecordPaymentLatency(finishedAt.Sub(startedAt))
+		c.recordPaymentLatency(finishedAt.Sub(startedAt))
 	}
 }
 
-func (c *Collector) RecordPaymentOutcome(status string, amount int64, currency string) {
+func (c *Collector) recordPaymentOutcome(status payment.Status, amount int64, currency string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	switch payment.Status(status) {
+	switch status {
 	case payment.StatusCompleted:
 		c.paymentsCompleted++
 		if amount > 0 && currency != "" {
@@ -155,7 +175,7 @@ func (c *Collector) RecordPaymentOutcome(status string, amount int64, currency s
 	}
 }
 
-func (c *Collector) RecordPaymentLatency(elapsed time.Duration) {
+func (c *Collector) recordPaymentLatency(elapsed time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -166,13 +186,13 @@ func (c *Collector) RecordPaymentLatency(elapsed time.Duration) {
 	}
 }
 
-func (c *Collector) RecordInsufficientFunds(_ string) {
+func (c *Collector) recordInsufficientFunds() {
 	c.mu.Lock()
 	c.insufficientFundsCount++
 	c.mu.Unlock()
 }
 
-func (c *Collector) RecordRefund(amount int64, currency string) {
+func (c *Collector) recordRefund(amount int64, currency string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

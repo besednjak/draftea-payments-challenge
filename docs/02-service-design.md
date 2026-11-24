@@ -100,7 +100,7 @@ Si una proyección se actualiza de forma asincrónica, un usuario que paga y con
 La estructura del repositorio refleja estos mismos límites con separación estricta por capas:
 
 - `internal/domain/` (`wallet`, `payment`, `events`): aggregates, reglas de negocio y contratos de eventos. **Sin dependencias externas**; `wallet` y `payment` no se importan entre sí.
-- `internal/application/` (`ports`, `saga`): interfaces (`EventStore`, `EventBus`, `GatewayClient`, `ReadModels`) y el orquestador de la saga.
+- `internal/application/` (`ports`, `wallet`, `saga`): interfaces (`EventStore`, `EventBus`, `PaymentGateway`, `ReadModels`), el servicio de comandos de `Wallet` y el orquestador de la saga.
 - `internal/infrastructure/` (`eventstore`, `eventbus`, `readmodel`, `gateway`): implementaciones en memoria y mock configurable de la pasarela (con latencia, timeouts y circuit breaker).
 - `internal/observability/`: logging estructurado (`slog`), métricas y health checks.
 - `cmd/demo/`: composición del sistema y ejecución de los escenarios.

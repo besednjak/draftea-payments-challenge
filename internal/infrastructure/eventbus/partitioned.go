@@ -14,7 +14,6 @@ import (
 
 	"github.com/besednjak/draftea-payments-challenge/internal/application/ports"
 	"github.com/besednjak/draftea-payments-challenge/internal/domain/events"
-	"github.com/besednjak/draftea-payments-challenge/internal/observability"
 )
 
 var ErrBusClosed = errors.New("event bus is closed")
@@ -27,6 +26,20 @@ func NonRetryable(err error) error {
 // IsNonRetryable reports whether err is marked as a permanent/poison-pill error.
 func IsNonRetryable(err error) bool {
 	return ports.IsNonRetryable(err)
+}
+
+// lifecycleContext binds message cancellation to the bus runCtx while preserving
+// caller context values (such as correlation_id, payment_id, wallet_id).
+type lifecycleContext struct {
+	context.Context
+	values context.Context
+}
+
+func (c lifecycleContext) Value(key any) any {
+	if val := c.values.Value(key); val != nil {
+		return val
+	}
+	return c.Context.Value(key)
 }
 
 // Config tunes the in-memory partitioned EventBus.
@@ -196,7 +209,10 @@ func (b *PartitionedBus) Publish(ctx context.Context, topic, partitionKey string
 	}
 
 	partitionIndex := b.partitionFor(partitionKey)
-	msgCtx := context.WithoutCancel(ctx)
+	msgCtx := lifecycleContext{
+		Context: b.runCtx,
+		values:  context.WithoutCancel(ctx),
+	}
 
 	b.addInFlight(1)
 	if !b.partitions[partitionIndex].push(busMessage{
@@ -231,7 +247,8 @@ func (b *PartitionedBus) Drain(ctx context.Context) error {
 }
 
 // Close stops accepting new publications and waits for in-flight messages to drain
-// until ctx expires, cancelling any active retry backoffs immediately on timeout.
+// until ctx expires. On deadline expiry, cancels runCtx so handlers/retries abort
+// and returns ctx.Err() without blocking indefinitely.
 func (b *PartitionedBus) Close(ctx context.Context) error {
 	b.closeOnce.Do(func() {
 		b.closed.Store(true)
@@ -252,7 +269,6 @@ func (b *PartitionedBus) Close(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		b.cancelRun()
-		<-done
 		return ctx.Err()
 	}
 }
@@ -317,7 +333,9 @@ func (b *PartitionedBus) runPartition(queue *partitionQueue) {
 		if !ok {
 			return
 		}
-		b.dispatch(msg)
+		if b.runCtx.Err() == nil {
+			b.dispatch(msg)
+		}
 		b.addInFlight(-1)
 	}
 }
@@ -329,6 +347,9 @@ func (b *PartitionedBus) dispatch(msg busMessage) {
 	b.subMu.RUnlock()
 
 	for _, sub := range subscribers {
+		if b.runCtx.Err() != nil {
+			return
+		}
 		b.deliverWithRetry(msg, sub)
 	}
 }
@@ -343,9 +364,15 @@ func (b *PartitionedBus) deliverWithRetry(msg busMessage, sub subscription) {
 	delay := b.cfg.RetryBaseDelay
 retryLoop:
 	for attempt := 1; attempt <= b.cfg.MaxAttempts; attempt++ {
+		if b.runCtx.Err() != nil {
+			return
+		}
 		attempts = attempt
 		err := sub.handler(msg.ctx, msg.envelope)
 		if err == nil {
+			return
+		}
+		if b.runCtx.Err() != nil {
 			return
 		}
 
@@ -402,8 +429,8 @@ func (b *PartitionedBus) sendToDLQ(
 		b.cfg.Metrics.RecordDLQMessage(msg.topic)
 	}
 
-	logCtx := observability.WithCorrelation(msg.ctx, msg.envelope.CorrelationID, "", "")
-	observability.LoggerFromContext(logCtx, b.cfg.Logger).Error("message routed to DLQ",
+	logCtx := ports.WithCorrelation(msg.ctx, msg.envelope.CorrelationID, "", "")
+	ports.LoggerFromContext(logCtx, b.cfg.Logger).Error("message routed to DLQ",
 		"dlq_topic", dlqName,
 		"original_topic", msg.topic,
 		"consumer_group", group,

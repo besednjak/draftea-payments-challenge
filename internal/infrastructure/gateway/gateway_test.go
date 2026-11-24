@@ -341,3 +341,191 @@ func TestAdapterCorruptPayloadIsNonRetryable(t *testing.T) {
 		t.Fatalf("expected non-retryable decode error, got %v", err)
 	}
 }
+
+func mustRefundCommandEnvelope(t *testing.T, paymentID, refundID string) events.Envelope {
+	t.Helper()
+	env, err := events.NewEnvelope(
+		events.CommandRefundPayment,
+		events.AggregateTypeGateway,
+		paymentID,
+		0,
+		events.RefundPaymentCommand{
+			PaymentID:   paymentID,
+			RefundID:    refundID,
+			Provider:    "mockpay",
+			ProviderRef: "prov_1",
+			Amount:      events.Money{Amount: 2000, Currency: "ARS"},
+		},
+		events.Metadata{CorrelationID: paymentID},
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("NewEnvelope refund failed: %v", err)
+	}
+	return env
+}
+
+func mustCheckStatusEnvelope(t *testing.T, paymentID string) events.Envelope {
+	t.Helper()
+	env, err := events.NewEnvelope(
+		events.CommandCheckPaymentStatus,
+		events.AggregateTypeGateway,
+		paymentID,
+		0,
+		events.CheckPaymentStatusCommand{
+			PaymentID: paymentID,
+			Provider:  "mockpay",
+		},
+		events.Metadata{CorrelationID: paymentID},
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("NewEnvelope check status failed: %v", err)
+	}
+	return env
+}
+
+func TestAdapterHandleRefundPaymentResilience(t *testing.T) {
+	fastRetry := gateway.RetryConfig{
+		MaxAttempts:    3,
+		BaseDelay:      time.Millisecond,
+		MaxDelay:       5 * time.Millisecond,
+		AttemptTimeout: time.Second,
+		Sleep:          func(context.Context, time.Duration) error { return nil },
+	}
+
+	t.Run("explicit provider decline emits GatewayRefundDeclined without tripping circuit", func(t *testing.T) {
+		mockGateway := gateway.NewMockGateway(gateway.MockBehavior{RefundDeclined: true})
+		breaker := gateway.NewCircuitBreaker(gateway.CircuitBreakerConfig{ConsecutiveTimeouts: 1})
+		publisher := &capturePublisher{}
+		adapter := gateway.NewAdapter(gateway.AdapterConfig{
+			Gateway:   mockGateway,
+			Publisher: publisher,
+			Breaker:   breaker,
+			Retry:     fastRetry,
+		})
+
+		err := adapter.HandleCommand(context.Background(), mustRefundCommandEnvelope(t, "pay_1", "ref_declined"))
+
+		if err != nil {
+			t.Fatalf("HandleCommand failed: %v", err)
+		}
+		if mockGateway.RefundCalls("ref_declined") != 1 {
+			t.Fatalf("expected 1 refund call on business decline, got %d", mockGateway.RefundCalls("ref_declined"))
+		}
+		if breaker.State() != gateway.StateClosed {
+			t.Fatalf("business decline must not trip circuit breaker, got %s", breaker.State())
+		}
+		emitted := publisher.list()
+		if len(emitted) != 1 || emitted[0].Type != events.EventGatewayRefundDeclined {
+			t.Fatalf("expected GatewayRefundDeclined, got %+v", emitted)
+		}
+	})
+
+	t.Run("transient timeout retries and succeeds on later attempt", func(t *testing.T) {
+		mockGateway := gateway.NewMockGateway(gateway.MockBehavior{RefundFailFirstNTimeouts: 2})
+		publisher := &capturePublisher{}
+		adapter := gateway.NewAdapter(gateway.AdapterConfig{
+			Gateway:   mockGateway,
+			Publisher: publisher,
+			Retry:     fastRetry,
+		})
+
+		err := adapter.HandleCommand(context.Background(), mustRefundCommandEnvelope(t, "pay_1", "ref_retry_ok"))
+
+		if err != nil {
+			t.Fatalf("HandleCommand failed: %v", err)
+		}
+		if mockGateway.RefundCalls("ref_retry_ok") != 3 {
+			t.Fatalf("expected 3 attempts, got %d", mockGateway.RefundCalls("ref_retry_ok"))
+		}
+		emitted := publisher.list()
+		if len(emitted) != 1 || emitted[0].Type != events.EventGatewayRefundApproved {
+			t.Fatalf("expected GatewayRefundApproved, got %+v", emitted)
+		}
+	})
+
+	t.Run("persistent timeout returns error without falsely emitting GatewayRefundDeclined", func(t *testing.T) {
+		mockGateway := gateway.NewMockGateway(gateway.MockBehavior{RefundAlwaysTimeout: true})
+		publisher := &capturePublisher{}
+		adapter := gateway.NewAdapter(gateway.AdapterConfig{
+			Gateway:   mockGateway,
+			Publisher: publisher,
+			Retry:     fastRetry,
+		})
+
+		err := adapter.HandleCommand(context.Background(), mustRefundCommandEnvelope(t, "pay_1", "ref_timeout"))
+
+		if err == nil {
+			t.Fatal("expected error on uncertain refund timeout")
+		}
+		if mockGateway.RefundCalls("ref_timeout") != 3 {
+			t.Fatalf("expected 3 retry attempts, got %d", mockGateway.RefundCalls("ref_timeout"))
+		}
+		if len(publisher.list()) != 0 {
+			t.Fatalf("timeout must never emit definitive GatewayRefundDeclined, got %+v", publisher.list())
+		}
+	})
+
+	t.Run("open circuit emits GatewayRefundDeclined without calling gateway", func(t *testing.T) {
+		breaker := gateway.NewCircuitBreaker(gateway.CircuitBreakerConfig{ConsecutiveTimeouts: 1})
+		breaker.RecordFailure(true)
+		mockGateway := gateway.NewMockGateway(gateway.MockBehavior{})
+		publisher := &capturePublisher{}
+		adapter := gateway.NewAdapter(gateway.AdapterConfig{
+			Gateway:   mockGateway,
+			Publisher: publisher,
+			Breaker:   breaker,
+			Retry:     fastRetry,
+		})
+
+		err := adapter.HandleCommand(context.Background(), mustRefundCommandEnvelope(t, "pay_1", "ref_cb_open"))
+
+		if err != nil {
+			t.Fatalf("HandleCommand failed: %v", err)
+		}
+		if mockGateway.RefundCalls("ref_cb_open") != 0 {
+			t.Fatalf("expected 0 calls when circuit open, got %d", mockGateway.RefundCalls("ref_cb_open"))
+		}
+		emitted := publisher.list()
+		if len(emitted) != 1 || emitted[0].Type != events.EventGatewayRefundDeclined {
+			t.Fatalf("expected GatewayRefundDeclined, got %+v", emitted)
+		}
+	})
+}
+
+func TestAdapterHandleCheckStatusOutcomes(t *testing.T) {
+	cases := []struct {
+		name          string
+		behavior      gateway.MockBehavior
+		wantEventType string
+	}{
+		{"approved status", gateway.MockBehavior{StatusOutcome: ports.GatewayOutcomeApproved}, events.EventGatewayPaymentApproved},
+		{"declined status", gateway.MockBehavior{StatusOutcome: ports.GatewayOutcomeDeclined, DeclineReason: "EXPIRED"}, events.EventGatewayPaymentDeclined},
+		{"not found status", gateway.MockBehavior{StatusOutcome: ports.GatewayOutcomeNotFound}, events.EventGatewayPaymentDeclined},
+		{"pending status", gateway.MockBehavior{StatusOutcome: ports.GatewayOutcomePending}, events.EventGatewayStatusPending},
+		{"unavailable error maps to pending", gateway.MockBehavior{AlwaysUnavailable: true}, events.EventGatewayStatusPending},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			publisher := &capturePublisher{}
+			adapter := gateway.NewAdapter(gateway.AdapterConfig{
+				Gateway:   gateway.NewMockGateway(tc.behavior),
+				Publisher: publisher,
+			})
+
+			err := adapter.HandleCommand(context.Background(), mustCheckStatusEnvelope(t, "pay_status"))
+
+			if err != nil {
+				t.Fatalf("HandleCommand failed: %v", err)
+			}
+			emitted := publisher.list()
+			if len(emitted) != 1 || emitted[0].Type != tc.wantEventType {
+				t.Fatalf("got %+v, want event type %s", emitted, tc.wantEventType)
+			}
+		})
+	}
+}

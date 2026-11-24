@@ -12,7 +12,6 @@ import (
 
 	"github.com/besednjak/draftea-payments-challenge/internal/application/ports"
 	"github.com/besednjak/draftea-payments-challenge/internal/domain/events"
-	"github.com/besednjak/draftea-payments-challenge/internal/observability"
 )
 
 const gatewayConsumerName = "gateway-adapter"
@@ -118,7 +117,7 @@ func (a *Adapter) HandleCommand(ctx context.Context, env events.Envelope) (retEr
 		}()
 	}
 
-	ctx = observability.WithCorrelation(ctx, env.CorrelationID, env.AggregateID, "")
+	ctx = ports.WithCorrelation(ctx, env.CorrelationID, env.AggregateID, "")
 
 	switch env.Type {
 	case events.CommandSubmitPayment:
@@ -156,7 +155,7 @@ func (a *Adapter) HandleWebhook(ctx context.Context, signature string, body []by
 	a.seenWebhooks[webhook.ProviderEventID] = struct{}{}
 	a.webhookMu.Unlock()
 
-	ctx = observability.WithCorrelation(ctx, webhook.PaymentID, webhook.PaymentID, "")
+	ctx = ports.WithCorrelation(ctx, webhook.PaymentID, webhook.PaymentID, "")
 	meta := events.Metadata{
 		CorrelationID: webhook.PaymentID,
 		CausationID:   webhook.ProviderEventID,
@@ -199,7 +198,7 @@ func (a *Adapter) handleSubmitPayment(ctx context.Context, env events.Envelope) 
 	if err != nil {
 		return ports.NonRetryable(err)
 	}
-	ctx = observability.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, "")
+	ctx = ports.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, "")
 	meta := events.Metadata{
 		CorrelationID: cmd.PaymentID,
 		CausationID:   env.EventID,
@@ -239,7 +238,7 @@ func (a *Adapter) handleSubmitPayment(ctx context.Context, env events.Envelope) 
 		}
 
 		sentAnyAttempt = true
-		start := a.clock()
+		start := time.Now()
 		attemptCtx, cancel := context.WithTimeout(ctx, a.retry.AttemptTimeout)
 		result, callErr := a.gatewayClient.SubmitPayment(attemptCtx, ports.GatewaySubmitRequest{
 			PaymentID: cmd.PaymentID,
@@ -248,7 +247,7 @@ func (a *Adapter) handleSubmitPayment(ctx context.Context, env events.Envelope) 
 			Amount:    cmd.Amount,
 		})
 		cancel()
-		elapsed := a.clock().Sub(start)
+		elapsed := time.Since(start)
 
 		if callErr == nil {
 			a.breaker.RecordSuccess()
@@ -261,7 +260,7 @@ func (a *Adapter) handleSubmitPayment(ctx context.Context, env events.Envelope) 
 		a.breaker.RecordFailure(isTimeout)
 		a.recordAttempt(cmd.Provider, "ERROR", elapsed)
 
-		observability.LoggerFromContext(ctx, a.logger).Warn("gateway submit attempt failed",
+		ports.LoggerFromContext(ctx, a.logger).Warn("gateway submit attempt failed",
 			"provider", cmd.Provider,
 			"attempt", attempt+1,
 			"max_attempts", a.retry.MaxAttempts,
@@ -333,7 +332,7 @@ func (a *Adapter) handleCheckStatus(ctx context.Context, env events.Envelope) er
 	if err != nil {
 		return ports.NonRetryable(err)
 	}
-	ctx = observability.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, "")
+	ctx = ports.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, "")
 	meta := events.Metadata{
 		CorrelationID: cmd.PaymentID,
 		CausationID:   env.EventID,
@@ -382,42 +381,103 @@ func (a *Adapter) handleRefundPayment(ctx context.Context, env events.Envelope) 
 	if err != nil {
 		return ports.NonRetryable(err)
 	}
-	ctx = observability.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, "")
+	ctx = ports.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, "")
 	meta := events.Metadata{
 		CorrelationID: cmd.PaymentID,
 		CausationID:   env.EventID,
 	}
 
-	attemptCtx, cancel := context.WithTimeout(ctx, a.retry.AttemptTimeout)
-	result, err := a.gatewayClient.RefundPayment(attemptCtx, ports.GatewayRefundRequest{
-		PaymentID:   cmd.PaymentID,
-		RefundID:    cmd.RefundID,
-		Provider:    cmd.Provider,
-		ProviderRef: cmd.ProviderRef,
-		Amount:      cmd.Amount,
-	})
-	cancel()
-
-	if err != nil || !result.Approved {
-		reason := result.Reason
-		if err != nil {
-			reason = err.Error()
-		}
+	select {
+	case a.bulkhead <- struct{}{}:
+		defer func() { <-a.bulkhead }()
+	default:
 		return a.emit(ctx, events.EventGatewayRefundDeclined, cmd.PaymentID, events.GatewayRefundDeclinedPayload{
 			PaymentID: cmd.PaymentID,
 			RefundID:  cmd.RefundID,
 			Provider:  cmd.Provider,
-			Reason:    reason,
+			Reason:    "BULKHEAD_SATURATED",
 		}, meta)
 	}
 
-	return a.emit(ctx, events.EventGatewayRefundApproved, cmd.PaymentID, events.GatewayRefundApprovedPayload{
-		PaymentID:   cmd.PaymentID,
-		RefundID:    cmd.RefundID,
-		Provider:    cmd.Provider,
-		ProviderRef: result.ProviderRef,
-		Amount:      cmd.Amount,
-	}, meta)
+	sentAnyAttempt := false
+	var lastErr error
+
+	for attempt := 0; attempt < a.retry.MaxAttempts; attempt++ {
+		if err := a.breaker.Allow(); err != nil {
+			if !sentAnyAttempt {
+				return a.emit(ctx, events.EventGatewayRefundDeclined, cmd.PaymentID, events.GatewayRefundDeclinedPayload{
+					PaymentID: cmd.PaymentID,
+					RefundID:  cmd.RefundID,
+					Provider:  cmd.Provider,
+					Reason:    events.ReasonCircuitOpen,
+				}, meta)
+			}
+			// A prior refund attempt already went over the wire: do not falsely mark as declined.
+			return fmt.Errorf("refund %s outcome uncertain after circuit opened: %w", cmd.RefundID, err)
+		}
+
+		sentAnyAttempt = true
+		start := time.Now()
+		attemptCtx, cancel := context.WithTimeout(ctx, a.retry.AttemptTimeout)
+		result, callErr := a.gatewayClient.RefundPayment(attemptCtx, ports.GatewayRefundRequest{
+			PaymentID:   cmd.PaymentID,
+			RefundID:    cmd.RefundID,
+			Provider:    cmd.Provider,
+			ProviderRef: cmd.ProviderRef,
+			Amount:      cmd.Amount,
+		})
+		cancel()
+		elapsed := time.Since(start)
+
+		if callErr == nil {
+			a.breaker.RecordSuccess()
+			if result.Approved {
+				a.recordAttempt(cmd.Provider, "REFUND_APPROVED", elapsed)
+				return a.emit(ctx, events.EventGatewayRefundApproved, cmd.PaymentID, events.GatewayRefundApprovedPayload{
+					PaymentID:   cmd.PaymentID,
+					RefundID:    cmd.RefundID,
+					Provider:    cmd.Provider,
+					ProviderRef: result.ProviderRef,
+					Amount:      cmd.Amount,
+				}, meta)
+			}
+
+			a.recordAttempt(cmd.Provider, "REFUND_DECLINED", elapsed)
+			reason := result.Reason
+			if reason == "" {
+				reason = "REFUND_DECLINED"
+			}
+			return a.emit(ctx, events.EventGatewayRefundDeclined, cmd.PaymentID, events.GatewayRefundDeclinedPayload{
+				PaymentID: cmd.PaymentID,
+				RefundID:  cmd.RefundID,
+				Provider:  cmd.Provider,
+				Reason:    reason,
+			}, meta)
+		}
+
+		lastErr = callErr
+		isTimeout := errors.Is(callErr, ports.ErrGatewayTimeout) || errors.Is(callErr, context.DeadlineExceeded)
+		a.breaker.RecordFailure(isTimeout)
+		a.recordAttempt(cmd.Provider, "REFUND_ERROR", elapsed)
+
+		ports.LoggerFromContext(ctx, a.logger).Warn("gateway refund attempt failed",
+			"provider", cmd.Provider,
+			"refund_id", cmd.RefundID,
+			"attempt", attempt+1,
+			"max_attempts", a.retry.MaxAttempts,
+			"error", callErr.Error(),
+		)
+
+		if attempt+1 < a.retry.MaxAttempts {
+			delay := FullJitterDelay(attempt, a.retry.BaseDelay, a.retry.MaxDelay, a.retry.RandFloat)
+			if sleepErr := a.retry.Sleep(ctx, delay); sleepErr != nil {
+				break
+			}
+		}
+	}
+
+	// Never convert a timeout or transient transport failure into a definitive GatewayRefundDeclined.
+	return fmt.Errorf("refund %s outcome uncertain after %d attempts: %w", cmd.RefundID, a.retry.MaxAttempts, lastErr)
 }
 
 func (a *Adapter) emit(ctx context.Context, eventType, paymentID string, payload any, meta events.Metadata) error {

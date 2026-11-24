@@ -13,7 +13,6 @@ import (
 	"github.com/besednjak/draftea-payments-challenge/internal/application/ports"
 	"github.com/besednjak/draftea-payments-challenge/internal/domain/events"
 	domainwallet "github.com/besednjak/draftea-payments-challenge/internal/domain/wallet"
-	"github.com/besednjak/draftea-payments-challenge/internal/observability"
 )
 
 const walletConsumerName = "wallet-service"
@@ -98,7 +97,7 @@ func NewService(cfg Config) *Service {
 // CreateWallet initializes a new wallet stream, updates the balance read model,
 // and publishes WalletCreated.
 func (s *Service) CreateWallet(ctx context.Context, walletID, userID, currency string) (*domainwallet.Wallet, error) {
-	ctx = observability.WithCorrelation(ctx, walletID, "", walletID)
+	ctx = ports.WithCorrelation(ctx, walletID, "", walletID)
 	createdWallet, err := domainwallet.Create(
 		walletID,
 		userID,
@@ -128,11 +127,11 @@ func (s *Service) CreateWallet(ctx context.Context, walletID, userID, currency s
 
 // Deposit credits funds to walletID with optimistic locking retry.
 func (s *Service) Deposit(ctx context.Context, walletID, referenceID string, amount events.Money) (*domainwallet.Wallet, error) {
-	ctx = observability.WithCorrelation(ctx, referenceID, "", walletID)
+	ctx = ports.WithCorrelation(ctx, referenceID, "", walletID)
 	meta := events.Metadata{CorrelationID: referenceID}
 	return s.executeWithRetry(ctx, walletID, func(w *domainwallet.Wallet) error {
 		return w.Deposit(referenceID, amount, meta)
-	})
+	}, nil)
 }
 
 // GetBalance queries the synchronous read-your-writes wallet balance view.
@@ -220,48 +219,48 @@ func (s *Service) HandleCommand(ctx context.Context, env events.Envelope) (retEr
 		if err != nil {
 			return ports.NonRetryable(err)
 		}
-		ctx = observability.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, cmd.WalletID)
+		ctx = ports.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, cmd.WalletID)
 		meta := events.Metadata{CorrelationID: cmd.PaymentID, CausationID: env.EventID}
 		_, err = s.executeWithRetry(ctx, cmd.WalletID, func(w *domainwallet.Wallet) error {
 			return w.Reserve(cmd.PaymentID, cmd.Amount, meta)
-		})
-		return err
+		}, matchReservedEvent(cmd.PaymentID))
+		return wrapPermanentDomainError(err)
 
 	case events.CommandCaptureFunds:
 		cmd, err := events.DecodePayload[events.CaptureFundsCommand](env)
 		if err != nil {
 			return ports.NonRetryable(err)
 		}
-		ctx = observability.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, cmd.WalletID)
+		ctx = ports.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, cmd.WalletID)
 		meta := events.Metadata{CorrelationID: cmd.PaymentID, CausationID: env.EventID}
 		_, err = s.executeWithRetry(ctx, cmd.WalletID, func(w *domainwallet.Wallet) error {
-			return w.Capture(cmd.PaymentID, cmd.Amount, meta)
-		})
-		return err
+			return w.Capture(cmd.PaymentID, cmd.ProviderRef, cmd.Amount, meta)
+		}, matchCapturedEvent(cmd.PaymentID))
+		return wrapPermanentDomainError(err)
 
 	case events.CommandReleaseFunds:
 		cmd, err := events.DecodePayload[events.ReleaseFundsCommand](env)
 		if err != nil {
 			return ports.NonRetryable(err)
 		}
-		ctx = observability.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, cmd.WalletID)
+		ctx = ports.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, cmd.WalletID)
 		meta := events.Metadata{CorrelationID: cmd.PaymentID, CausationID: env.EventID}
 		_, err = s.executeWithRetry(ctx, cmd.WalletID, func(w *domainwallet.Wallet) error {
 			return w.Release(cmd.PaymentID, cmd.Reason, meta)
-		})
-		return err
+		}, matchReleasedEvent(cmd.PaymentID))
+		return wrapPermanentDomainError(err)
 
 	case events.CommandRefundFunds:
 		cmd, err := events.DecodePayload[events.RefundFundsCommand](env)
 		if err != nil {
 			return ports.NonRetryable(err)
 		}
-		ctx = observability.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, cmd.WalletID)
+		ctx = ports.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, cmd.WalletID)
 		meta := events.Metadata{CorrelationID: cmd.PaymentID, CausationID: env.EventID}
 		_, err = s.executeWithRetry(ctx, cmd.WalletID, func(w *domainwallet.Wallet) error {
 			return w.Refund(cmd.PaymentID, cmd.RefundID, cmd.Amount, meta)
-		})
-		return err
+		}, matchRefundedEvent(cmd.RefundID))
+		return wrapPermanentDomainError(err)
 
 	default:
 		return nil
@@ -272,6 +271,7 @@ func (s *Service) executeWithRetry(
 	ctx context.Context,
 	walletID string,
 	mutate func(*domainwallet.Wallet) error,
+	republishMatch func(events.Envelope) bool,
 ) (*domainwallet.Wallet, error) {
 	var lastErr error
 
@@ -288,6 +288,16 @@ func (s *Service) executeWithRetry(
 
 		uncommitted := loaded.UncommittedEvents()
 		if len(uncommitted) == 0 {
+			// Command effect was already persisted (e.g., retry after Publish failure or recovery).
+			// Re-sync the read model and republish the persisted event so the saga never stalls.
+			if err := s.syncBalanceView(ctx, loaded); err != nil {
+				return nil, err
+			}
+			if republishMatch != nil {
+				if err := s.republishPersistedEvent(ctx, loaded, republishMatch); err != nil {
+					return nil, err
+				}
+			}
 			return loaded, nil
 		}
 
@@ -312,7 +322,7 @@ func (s *Service) executeWithRetry(
 		if s.metrics != nil {
 			s.metrics.RecordOptimisticLockRetry(events.AggregateTypeWallet)
 		}
-		observability.LoggerFromContext(ctx, s.logger).Warn("wallet optimistic lock conflict, reloading aggregate",
+		ports.LoggerFromContext(ctx, s.logger).Warn("wallet optimistic lock conflict, reloading aggregate",
 			"attempt", attempt+1,
 			"max_retries", s.maxLockRetries,
 		)
@@ -333,6 +343,26 @@ func (s *Service) executeWithRetry(
 	}
 
 	return nil, fmt.Errorf("wallet %s failed after %d optimistic lock retries: %w", walletID, s.maxLockRetries, lastErr)
+}
+
+func (s *Service) republishPersistedEvent(
+	ctx context.Context,
+	w *domainwallet.Wallet,
+	match func(events.Envelope) bool,
+) error {
+	if s.publisher == nil {
+		return nil
+	}
+	history, err := s.store.LoadStream(ctx, w.StreamID(), 0)
+	if err != nil {
+		return err
+	}
+	for index := len(history) - 1; index >= 0; index-- {
+		if match(history[index]) {
+			return s.publisher.Publish(ctx, events.TopicWalletsEvents, w.ID(), history[index])
+		}
+	}
+	return nil
 }
 
 func (s *Service) syncBalanceView(ctx context.Context, w *domainwallet.Wallet) error {
@@ -360,7 +390,7 @@ func (s *Service) maybeSaveSnapshot(ctx context.Context, w *domainwallet.Wallet,
 	}
 	encoded, err := json.Marshal(w.TakeSnapshot())
 	if err != nil {
-		observability.LoggerFromContext(ctx, s.logger).Error("marshal wallet snapshot failed", "error", err.Error())
+		ports.LoggerFromContext(ctx, s.logger).Error("marshal wallet snapshot failed", "error", err.Error())
 		return
 	}
 	if err := s.snapshots.SaveSnapshot(ctx, ports.Snapshot{
@@ -369,7 +399,7 @@ func (s *Service) maybeSaveSnapshot(ctx context.Context, w *domainwallet.Wallet,
 		State:     encoded,
 		CreatedAt: s.clock().UTC(),
 	}); err != nil {
-		observability.LoggerFromContext(ctx, s.logger).Error("save wallet snapshot failed", "error", err.Error())
+		ports.LoggerFromContext(ctx, s.logger).Error("save wallet snapshot failed", "error", err.Error())
 	}
 }
 
@@ -383,4 +413,73 @@ func (s *Service) publishEvents(ctx context.Context, walletID string, evts []eve
 		}
 	}
 	return nil
+}
+
+func wrapPermanentDomainError(err error) error {
+	if err == nil {
+		return nil
+	}
+	permanentErrors := []error{
+		domainwallet.ErrInvalidWalletID,
+		domainwallet.ErrInvalidUserID,
+		domainwallet.ErrInvalidPaymentID,
+		domainwallet.ErrInvalidRefundID,
+		domainwallet.ErrWalletAlreadyCreated,
+		domainwallet.ErrWalletNotCreated,
+		domainwallet.ErrCurrencyMismatch,
+		domainwallet.ErrReservationNotFound,
+		domainwallet.ErrReservationAlreadyCaptured,
+		domainwallet.ErrCaptureAmountMismatch,
+		domainwallet.ErrPaymentNotCaptured,
+		domainwallet.ErrRefundExceedsCaptured,
+		domainwallet.ErrAmountOverflow,
+		events.ErrInvalidAmount,
+		events.ErrInvalidCurrency,
+	}
+	for _, target := range permanentErrors {
+		if errors.Is(err, target) {
+			return ports.NonRetryable(err)
+		}
+	}
+	return err
+}
+
+func matchReservedEvent(paymentID string) func(events.Envelope) bool {
+	return func(env events.Envelope) bool {
+		if env.Type != events.EventFundsReserved {
+			return false
+		}
+		payload, err := events.DecodePayload[events.FundsReservedPayload](env)
+		return err == nil && payload.PaymentID == paymentID
+	}
+}
+
+func matchCapturedEvent(paymentID string) func(events.Envelope) bool {
+	return func(env events.Envelope) bool {
+		if env.Type != events.EventFundsCaptured {
+			return false
+		}
+		payload, err := events.DecodePayload[events.FundsCapturedPayload](env)
+		return err == nil && payload.PaymentID == paymentID
+	}
+}
+
+func matchReleasedEvent(paymentID string) func(events.Envelope) bool {
+	return func(env events.Envelope) bool {
+		if env.Type != events.EventFundsReleased {
+			return false
+		}
+		payload, err := events.DecodePayload[events.FundsReleasedPayload](env)
+		return err == nil && payload.PaymentID == paymentID
+	}
+}
+
+func matchRefundedEvent(refundID string) func(events.Envelope) bool {
+	return func(env events.Envelope) bool {
+		if env.Type != events.EventFundsRefunded {
+			return false
+		}
+		payload, err := events.DecodePayload[events.FundsRefundedPayload](env)
+		return err == nil && payload.RefundID == refundID
+	}
 }

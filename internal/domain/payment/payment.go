@@ -109,23 +109,25 @@ type InitiateParams struct {
 }
 
 // Payment is the Event-Sourced aggregate owning the payment lifecycle state machine
-// and refund invariants (refundedTotal <= capturedAmount).
+// and refund invariants (refundedTotal + pendingRefundTotal <= capturedAmount).
 type Payment struct {
-	id             string
-	walletID       string
-	userID         string
-	serviceID      string
-	provider       string
-	amount         events.Money
-	status         Status
-	providerRef    string
-	failureReason  string
-	capturedAmount int64
-	refundedTotal  int64
-	refunds        map[string]int64
-	createdAt      time.Time
-	version        int64
-	initiated      bool
+	id                 string
+	walletID           string
+	userID             string
+	serviceID          string
+	provider           string
+	amount             events.Money
+	status             Status
+	providerRef        string
+	failureReason      string
+	capturedAmount     int64
+	refundedTotal      int64
+	pendingRefundTotal int64
+	refunds            map[string]int64
+	pendingRefunds     map[string]int64
+	createdAt          time.Time
+	version            int64
+	initiated          bool
 
 	uncommitted []events.Envelope
 	clock       events.Clock
@@ -134,9 +136,10 @@ type Payment struct {
 
 func newEmpty(opts ...Option) *Payment {
 	p := &Payment{
-		refunds: make(map[string]int64),
-		clock:   events.DefaultClock,
-		idGen:   events.NewUUID,
+		refunds:        make(map[string]int64),
+		pendingRefunds: make(map[string]int64),
+		clock:          events.DefaultClock,
+		idGen:          events.NewUUID,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -295,7 +298,65 @@ func (p *Payment) MarkFailed(reason string, meta events.Metadata) error {
 	return p.record(events.EventPaymentFailed, p.id, payload, meta)
 }
 
-// RecordRefund applies a partial or full refund on a COMPLETED payment.
+// RequestRefund reserves an in-flight refund amount on a COMPLETED payment so
+// concurrent refund requests cannot collectively exceed capturedAmount.
+func (p *Payment) RequestRefund(refundID string, amount events.Money, meta events.Metadata) error {
+	if !p.initiated {
+		return ErrPaymentNotInitiated
+	}
+	if refundID == "" {
+		return ErrInvalidRefundID
+	}
+	money, err := events.NewMoney(amount.Amount, amount.Currency)
+	if err != nil {
+		return err
+	}
+	if _, completed := p.refunds[refundID]; completed {
+		return nil
+	}
+	if _, pending := p.pendingRefunds[refundID]; pending {
+		return nil
+	}
+	if p.status != StatusCompleted {
+		return fmt.Errorf("%w: cannot refund payment in status %s", ErrInvalidTransition, p.status)
+	}
+	if money.Currency != p.amount.Currency {
+		return fmt.Errorf("%w: payment=%s refund=%s", ErrCurrencyMismatch, p.amount.Currency, money.Currency)
+	}
+	if money.Amount > p.RefundableAmount() {
+		return fmt.Errorf("%w: captured=%d refunded=%d pending=%d requested=%d",
+			ErrRefundExceedsCaptured, p.capturedAmount, p.refundedTotal, p.pendingRefundTotal, money.Amount)
+	}
+
+	payload := events.PaymentRefundRequestedPayload{
+		PaymentID: p.id,
+		RefundID:  refundID,
+		Amount:    money,
+	}
+	return p.record(events.EventPaymentRefundRequested, p.id, payload, meta)
+}
+
+// DeclineRefund releases an in-flight refund reservation after an explicit gateway decline.
+func (p *Payment) DeclineRefund(refundID, reason string, meta events.Metadata) error {
+	if !p.initiated {
+		return ErrPaymentNotInitiated
+	}
+	if refundID == "" {
+		return ErrInvalidRefundID
+	}
+	if _, pending := p.pendingRefunds[refundID]; !pending {
+		return nil
+	}
+
+	payload := events.PaymentRefundDeclinedPayload{
+		PaymentID: p.id,
+		RefundID:  refundID,
+		Reason:    reason,
+	}
+	return p.record(events.EventPaymentRefundDeclined, p.id, payload, meta)
+}
+
+// RecordRefund applies a settled partial or full refund on a COMPLETED payment.
 // It is idempotent per refundID and enforces refundedTotal + amount <= capturedAmount.
 func (p *Payment) RecordRefund(refundID string, amount events.Money, meta events.Metadata) error {
 	if !p.initiated {
@@ -317,7 +378,12 @@ func (p *Payment) RecordRefund(refundID string, amount events.Money, meta events
 	if money.Currency != p.amount.Currency {
 		return fmt.Errorf("%w: payment=%s refund=%s", ErrCurrencyMismatch, p.amount.Currency, money.Currency)
 	}
-	if p.refundedTotal+money.Amount > p.capturedAmount {
+
+	availableLimit := p.RefundableAmount()
+	if reserved, wasPending := p.pendingRefunds[refundID]; wasPending {
+		availableLimit += reserved
+	}
+	if money.Amount > availableLimit {
 		return fmt.Errorf("%w: captured=%d refunded=%d requested=%d",
 			ErrRefundExceedsCaptured, p.capturedAmount, p.refundedTotal, money.Amount)
 	}
@@ -419,10 +485,32 @@ func (p *Payment) Apply(env events.Envelope) error {
 		p.status = StatusFailed
 		p.failureReason = payload.Reason
 
+	case events.EventPaymentRefundRequested:
+		payload, err := events.DecodePayload[events.PaymentRefundRequestedPayload](env)
+		if err != nil {
+			return err
+		}
+		p.pendingRefunds[payload.RefundID] = payload.Amount.Amount
+		p.pendingRefundTotal += payload.Amount.Amount
+
+	case events.EventPaymentRefundDeclined:
+		payload, err := events.DecodePayload[events.PaymentRefundDeclinedPayload](env)
+		if err != nil {
+			return err
+		}
+		if reserved, exists := p.pendingRefunds[payload.RefundID]; exists {
+			delete(p.pendingRefunds, payload.RefundID)
+			p.pendingRefundTotal -= reserved
+		}
+
 	case events.EventPaymentRefunded:
 		payload, err := events.DecodePayload[events.PaymentRefundedPayload](env)
 		if err != nil {
 			return err
+		}
+		if reserved, exists := p.pendingRefunds[payload.RefundID]; exists {
+			delete(p.pendingRefunds, payload.RefundID)
+			p.pendingRefundTotal -= reserved
 		}
 		p.refundedTotal = payload.RefundedTotal
 		p.refunds[payload.RefundID] = payload.Amount.Amount
@@ -483,10 +571,19 @@ func (p *Payment) ProviderRef() string     { return p.providerRef }
 func (p *Payment) FailureReason() string   { return p.failureReason }
 func (p *Payment) CapturedAmount() int64   { return p.capturedAmount }
 func (p *Payment) RefundedTotal() int64    { return p.refundedTotal }
-func (p *Payment) RefundableAmount() int64 { return p.capturedAmount - p.refundedTotal }
-func (p *Payment) CreatedAt() time.Time    { return p.createdAt }
-func (p *Payment) Version() int64          { return p.version }
-func (p *Payment) StreamID() string        { return events.StreamID(events.AggregateTypePayment, p.id) }
+func (p *Payment) PendingRefundTotal() int64 { return p.pendingRefundTotal }
+func (p *Payment) RefundableAmount() int64 {
+	return p.capturedAmount - p.refundedTotal - p.pendingRefundTotal
+}
+func (p *Payment) CreatedAt() time.Time { return p.createdAt }
+func (p *Payment) Version() int64       { return p.version }
+func (p *Payment) StreamID() string     { return events.StreamID(events.AggregateTypePayment, p.id) }
+
+// HasPendingRefund reports whether refundID is currently reserved in flight.
+func (p *Payment) HasPendingRefund(refundID string) bool {
+	_, exists := p.pendingRefunds[refundID]
+	return exists
+}
 
 // BaseVersion returns the aggregate version prior to any uncommitted events.
 func (p *Payment) BaseVersion() int64 {

@@ -51,6 +51,10 @@ type MockBehavior struct {
 	ProviderRef string
 	// RefundDeclined causes RefundPayment to return Approved=false.
 	RefundDeclined bool
+	// RefundFailFirstNTimeouts causes the first N RefundPayment calls to return ErrGatewayTimeout.
+	RefundFailFirstNTimeouts int
+	// RefundAlwaysTimeout causes every RefundPayment call to return ErrGatewayTimeout.
+	RefundAlwaysTimeout bool
 }
 
 // MockGateway is a configurable in-memory external payment provider simulator.
@@ -126,6 +130,12 @@ func (m *MockGateway) StatusCalls(paymentID string) int {
 	return m.statusCalls[paymentID]
 }
 
+func (m *MockGateway) RefundCalls(refundID string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.refundCalls[refundID]
+}
+
 func (m *MockGateway) ruleForLocked(paymentID string) MockBehavior {
 	if rule, exists := m.rules[paymentID]; exists {
 		return rule
@@ -197,10 +207,14 @@ func (m *MockGateway) CheckStatus(ctx context.Context, paymentID, _ string) (por
 func (m *MockGateway) RefundPayment(ctx context.Context, req ports.GatewayRefundRequest) (ports.GatewayRefundResult, error) {
 	m.mu.Lock()
 	m.refundCalls[req.RefundID]++
+	attempt := m.refundCalls[req.RefundID]
 	rule := m.ruleForLocked(req.PaymentID)
 	m.mu.Unlock()
 
 	if err := ctx.Err(); err != nil {
+		return ports.GatewayRefundResult{}, ports.ErrGatewayTimeout
+	}
+	if rule.RefundAlwaysTimeout || attempt <= rule.RefundFailFirstNTimeouts {
 		return ports.GatewayRefundResult{}, ports.ErrGatewayTimeout
 	}
 	if rule.RefundDeclined {

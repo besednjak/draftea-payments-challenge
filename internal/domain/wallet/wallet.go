@@ -3,6 +3,7 @@ package wallet
 import (
 	"fmt"
 	"maps"
+	"math"
 
 	"github.com/besednjak/draftea-payments-challenge/internal/domain/events"
 )
@@ -31,17 +32,18 @@ func WithIDGenerator(gen events.IDGenerator) Option {
 // Snapshot captures the full Wallet aggregate state at a given version so long
 // event streams do not need to be replayed from version 1.
 type Snapshot struct {
-	WalletID     string           `json:"wallet_id"`
-	UserID       string           `json:"user_id"`
-	Currency     string           `json:"currency"`
-	Balance      int64            `json:"balance"`
-	Held         int64            `json:"held"`
-	Version      int64            `json:"version"`
-	Deposits     map[string]bool  `json:"deposits,omitempty"`
-	Reservations map[string]int64 `json:"reservations,omitempty"`
-	Captured     map[string]int64 `json:"captured,omitempty"`
-	Released     map[string]bool  `json:"released,omitempty"`
-	Refunds      map[string]int64 `json:"refunds,omitempty"`
+	WalletID          string           `json:"wallet_id"`
+	UserID            string           `json:"user_id"`
+	Currency          string           `json:"currency"`
+	Balance           int64            `json:"balance"`
+	Held              int64            `json:"held"`
+	Version           int64            `json:"version"`
+	Deposits          map[string]bool  `json:"deposits,omitempty"`
+	Reservations      map[string]int64 `json:"reservations,omitempty"`
+	Captured          map[string]int64 `json:"captured,omitempty"`
+	Released          map[string]bool  `json:"released,omitempty"`
+	Refunds           map[string]int64 `json:"refunds,omitempty"`
+	RefundedByPayment map[string]int64 `json:"refunded_by_payment,omitempty"`
 }
 
 // Wallet is the Event-Sourced aggregate acting as the source of truth for a user's
@@ -55,11 +57,12 @@ type Wallet struct {
 	version  int64
 	created  bool
 
-	deposits     map[string]bool
-	reservations map[string]int64
-	captured     map[string]int64
-	released     map[string]bool
-	refunds      map[string]int64
+	deposits          map[string]bool
+	reservations      map[string]int64
+	captured          map[string]int64
+	released          map[string]bool
+	refunds           map[string]int64
+	refundedByPayment map[string]int64
 
 	uncommitted []events.Envelope
 	clock       events.Clock
@@ -68,13 +71,14 @@ type Wallet struct {
 
 func newEmpty(opts ...Option) *Wallet {
 	w := &Wallet{
-		deposits:     make(map[string]bool),
-		reservations: make(map[string]int64),
-		captured:     make(map[string]int64),
-		released:     make(map[string]bool),
-		refunds:      make(map[string]int64),
-		clock:        events.DefaultClock,
-		idGen:        events.NewUUID,
+		deposits:          make(map[string]bool),
+		reservations:      make(map[string]int64),
+		captured:          make(map[string]int64),
+		released:          make(map[string]bool),
+		refunds:           make(map[string]int64),
+		refundedByPayment: make(map[string]int64),
+		clock:             events.DefaultClock,
+		idGen:             events.NewUUID,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -128,6 +132,7 @@ func Rehydrate(snapshot *Snapshot, history []events.Envelope, opts ...Option) (*
 		maps.Copy(w.captured, snapshot.Captured)
 		maps.Copy(w.released, snapshot.Released)
 		maps.Copy(w.refunds, snapshot.Refunds)
+		maps.Copy(w.refundedByPayment, snapshot.RefundedByPayment)
 	}
 
 	for _, env := range history {
@@ -159,6 +164,9 @@ func (w *Wallet) Deposit(referenceID string, amount events.Money, meta events.Me
 	}
 	if referenceID != "" && w.deposits[referenceID] {
 		return nil
+	}
+	if money.Amount > math.MaxInt64-w.balance {
+		return ErrAmountOverflow
 	}
 
 	balanceAfter := w.balance + money.Amount
@@ -229,7 +237,7 @@ func (w *Wallet) Reserve(paymentID string, amount events.Money, meta events.Meta
 }
 
 // Capture permanently deducts an active reservation for paymentID (idempotent).
-func (w *Wallet) Capture(paymentID string, amount events.Money, meta events.Metadata) error {
+func (w *Wallet) Capture(paymentID, providerRef string, amount events.Money, meta events.Metadata) error {
 	if !w.created {
 		return ErrWalletNotCreated
 	}
@@ -259,6 +267,7 @@ func (w *Wallet) Capture(paymentID string, amount events.Money, meta events.Meta
 	heldAfter := w.held - money.Amount
 	payload := events.FundsCapturedPayload{
 		PaymentID:      paymentID,
+		ProviderRef:    providerRef,
 		Amount:         money,
 		BalanceAfter:   balanceAfter,
 		HeldAfter:      heldAfter,
@@ -300,6 +309,7 @@ func (w *Wallet) Release(paymentID, reason string, meta events.Metadata) error {
 }
 
 // Refund credits a refund amount back into the wallet balance (idempotent per refundID).
+// Enforces that paymentID was captured in this wallet and refundedByPayment + amount <= captured.
 func (w *Wallet) Refund(paymentID, refundID string, amount events.Money, meta events.Metadata) error {
 	if !w.created {
 		return ErrWalletNotCreated
@@ -319,6 +329,19 @@ func (w *Wallet) Refund(paymentID, refundID string, amount events.Money, meta ev
 	}
 	if _, alreadyRefunded := w.refunds[refundID]; alreadyRefunded {
 		return nil
+	}
+
+	capturedAmount, captured := w.captured[paymentID]
+	if !captured {
+		return fmt.Errorf("%w: payment_id=%s", ErrPaymentNotCaptured, paymentID)
+	}
+	alreadyRefundedForPayment := w.refundedByPayment[paymentID]
+	if money.Amount > capturedAmount-alreadyRefundedForPayment {
+		return fmt.Errorf("%w: payment_id=%s captured=%d refunded=%d requested=%d",
+			ErrRefundExceedsCaptured, paymentID, capturedAmount, alreadyRefundedForPayment, money.Amount)
+	}
+	if money.Amount > math.MaxInt64-w.balance {
+		return ErrAmountOverflow
 	}
 
 	balanceAfter := w.balance + money.Amount
@@ -405,6 +428,7 @@ func (w *Wallet) Apply(env events.Envelope) error {
 		}
 		w.balance += payload.Amount.Amount
 		w.refunds[payload.RefundID] = payload.Amount.Amount
+		w.refundedByPayment[payload.PaymentID] += payload.Amount.Amount
 
 	default:
 		return fmt.Errorf("%w: %s", ErrUnknownEventType, env.Type)
@@ -438,23 +462,25 @@ func (w *Wallet) record(eventType, aggregateID string, payload any, meta events.
 // TakeSnapshot returns a deep copy of the current state for snapshot persistence.
 func (w *Wallet) TakeSnapshot() Snapshot {
 	snapshot := Snapshot{
-		WalletID:     w.id,
-		UserID:       w.userID,
-		Currency:     w.currency,
-		Balance:      w.balance,
-		Held:         w.held,
-		Version:      w.version,
-		Deposits:     make(map[string]bool, len(w.deposits)),
-		Reservations: make(map[string]int64, len(w.reservations)),
-		Captured:     make(map[string]int64, len(w.captured)),
-		Released:     make(map[string]bool, len(w.released)),
-		Refunds:      make(map[string]int64, len(w.refunds)),
+		WalletID:          w.id,
+		UserID:            w.userID,
+		Currency:          w.currency,
+		Balance:           w.balance,
+		Held:              w.held,
+		Version:           w.version,
+		Deposits:          make(map[string]bool, len(w.deposits)),
+		Reservations:      make(map[string]int64, len(w.reservations)),
+		Captured:          make(map[string]int64, len(w.captured)),
+		Released:          make(map[string]bool, len(w.released)),
+		Refunds:           make(map[string]int64, len(w.refunds)),
+		RefundedByPayment: make(map[string]int64, len(w.refundedByPayment)),
 	}
 	maps.Copy(snapshot.Deposits, w.deposits)
 	maps.Copy(snapshot.Reservations, w.reservations)
 	maps.Copy(snapshot.Captured, w.captured)
 	maps.Copy(snapshot.Released, w.released)
 	maps.Copy(snapshot.Refunds, w.refunds)
+	maps.Copy(snapshot.RefundedByPayment, w.refundedByPayment)
 	return snapshot
 }
 
