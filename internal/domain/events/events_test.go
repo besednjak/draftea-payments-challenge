@@ -10,20 +10,21 @@ import (
 )
 
 func TestNewMoney(t *testing.T) {
-	t.Run("valid and normalizes currency", func(t *testing.T) {
-		m, err := events.NewMoney(15000, " ars ")
+	t.Run("validates and normalizes currency", func(t *testing.T) {
+		money, err := events.NewMoney(15000, " ars ")
+
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if m.Amount != 15000 || m.Currency != "ARS" {
-			t.Fatalf("got %+v, want {15000 ARS}", m)
+		if money.Amount != 15000 || money.Currency != "ARS" {
+			t.Fatalf("got %+v, want {15000 ARS}", money)
 		}
-		if m.String() != "15000 ARS" {
-			t.Fatalf("got string %q, want %q", m.String(), "15000 ARS")
+		if money.String() != "15000 ARS" {
+			t.Fatalf("got string %q, want %q", money.String(), "15000 ARS")
 		}
 	})
 
-	cases := []struct {
+	invalidCases := []struct {
 		name     string
 		amount   int64
 		currency string
@@ -37,9 +38,10 @@ func TestNewMoney(t *testing.T) {
 		{"numeric currency", 100, "123", events.ErrInvalidCurrency},
 	}
 
-	for _, tc := range cases {
+	for _, tc := range invalidCases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := events.NewMoney(tc.amount, tc.currency)
+
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("got err=%v, want %v", err, tc.wantErr)
 			}
@@ -48,34 +50,31 @@ func TestNewMoney(t *testing.T) {
 }
 
 func TestMoneySameCurrency(t *testing.T) {
-	a := events.Money{Amount: 100, Currency: "ARS"}
-	b := events.Money{Amount: 500, Currency: "ars"}
-	c := events.Money{Amount: 100, Currency: "USD"}
+	arsUpper := events.Money{Amount: 100, Currency: "ARS"}
+	arsLower := events.Money{Amount: 500, Currency: "ars"}
+	usdMoney := events.Money{Amount: 100, Currency: "USD"}
 
-	if !a.SameCurrency(b) {
+	if !arsUpper.SameCurrency(arsLower) {
 		t.Fatal("expected ARS and ars to match")
 	}
-	if a.SameCurrency(c) {
+	if arsUpper.SameCurrency(usdMoney) {
 		t.Fatal("expected ARS and USD not to match")
 	}
 }
 
 func TestNewUUID(t *testing.T) {
-	id1 := events.NewUUID()
-	id2 := events.NewUUID()
+	firstID := events.NewUUID()
+	secondID := events.NewUUID()
 
-	if len(id1) != 36 {
-		t.Fatalf("expected UUID length 36, got %d (%q)", len(id1), id1)
+	if len(firstID) != 36 {
+		t.Fatalf("expected UUID length 36, got %d (%q)", len(firstID), firstID)
 	}
-	if id1 == id2 {
-		t.Fatalf("expected unique UUIDs, got duplicate %q", id1)
+	if firstID == secondID {
+		t.Fatalf("expected unique UUIDs, got duplicate %q", firstID)
 	}
-	parts := strings.Split(id1, "-")
-	if len(parts) != 5 {
-		t.Fatalf("expected 5 hyphen-separated parts, got %q", id1)
-	}
-	if parts[2][0] != '4' {
-		t.Fatalf("expected UUIDv4 nibble '4', got %q", id1)
+	parts := strings.Split(firstID, "-")
+	if len(parts) != 5 || parts[2][0] != '4' {
+		t.Fatalf("expected RFC 4122 v4 UUID, got %q", firstID)
 	}
 }
 
@@ -83,8 +82,7 @@ func TestEnvelopeRoundtripAndDeterministicHooks(t *testing.T) {
 	fixedTime := time.Date(2026, 11, 24, 15, 0, 0, 0, time.UTC)
 	fixedClock := func() time.Time { return fixedTime }
 	fixedID := func() string { return "evt-fixed-001" }
-
-	payload := events.FundsReservedPayload{
+	expectedPayload := events.FundsReservedPayload{
 		PaymentID:      "pay_1",
 		Amount:         events.Money{Amount: 2500, Currency: "ARS"},
 		BalanceAfter:   10000,
@@ -97,15 +95,15 @@ func TestEnvelopeRoundtripAndDeterministicHooks(t *testing.T) {
 		events.AggregateTypeWallet,
 		"wal_1",
 		3,
-		payload,
+		expectedPayload,
 		events.Metadata{CorrelationID: "pay_1", CausationID: "cmd_1"},
 		fixedClock,
 		fixedID,
 	)
+
 	if err != nil {
 		t.Fatalf("NewEnvelope error: %v", err)
 	}
-
 	if env.EventID != "evt-fixed-001" {
 		t.Fatalf("got EventID=%q, want evt-fixed-001", env.EventID)
 	}
@@ -120,22 +118,34 @@ func TestEnvelopeRoundtripAndDeterministicHooks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodePayload error: %v", err)
 	}
-	if decoded != payload {
-		t.Fatalf("decoded=%+v, want %+v", decoded, payload)
+	if decoded != expectedPayload {
+		t.Fatalf("decoded=%+v, want %+v", decoded, expectedPayload)
 	}
 }
 
 func TestEnvelopeValidationAndHelpers(t *testing.T) {
-	if _, err := events.NewEnvelope("", "wallet", "wal_1", 1, struct{}{}, events.Metadata{}, nil, nil); !errors.Is(err, events.ErrInvalidEnvelope) {
-		t.Fatalf("expected ErrInvalidEnvelope for empty eventType, got %v", err)
-	}
-	if _, err := events.NewEnvelope("wallet.Created", "wallet", "wal_1", -1, struct{}{}, events.Metadata{}, nil, nil); !errors.Is(err, events.ErrInvalidEnvelope) {
-		t.Fatalf("expected ErrInvalidEnvelope for negative version, got %v", err)
-	}
-	if got := events.StreamID(events.AggregateTypeWallet, "wal_123"); got != "wallet-wal_123" {
-		t.Fatalf("got StreamID=%q, want wallet-wal_123", got)
-	}
-	if got := events.DLQTopic(events.TopicWalletsCommands); got != "wallets.commands.v1.dlq" {
-		t.Fatalf("got DLQTopic=%q, want wallets.commands.v1.dlq", got)
-	}
+	t.Run("rejects empty event type", func(t *testing.T) {
+		_, err := events.NewEnvelope("", "wallet", "wal_1", 1, struct{}{}, events.Metadata{}, nil, nil)
+
+		if !errors.Is(err, events.ErrInvalidEnvelope) {
+			t.Fatalf("expected ErrInvalidEnvelope, got %v", err)
+		}
+	})
+
+	t.Run("rejects negative aggregate version", func(t *testing.T) {
+		_, err := events.NewEnvelope("wallet.Created", "wallet", "wal_1", -1, struct{}{}, events.Metadata{}, nil, nil)
+
+		if !errors.Is(err, events.ErrInvalidEnvelope) {
+			t.Fatalf("expected ErrInvalidEnvelope, got %v", err)
+		}
+	})
+
+	t.Run("formats stream ID and DLQ topic", func(t *testing.T) {
+		if got := events.StreamID(events.AggregateTypeWallet, "wal_123"); got != "wallet-wal_123" {
+			t.Fatalf("got StreamID=%q, want wallet-wal_123", got)
+		}
+		if got := events.DLQTopic(events.TopicWalletsCommands); got != "wallets.commands.v1.dlq" {
+			t.Fatalf("got DLQTopic=%q, want wallets.commands.v1.dlq", got)
+		}
+	})
 }

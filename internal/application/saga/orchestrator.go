@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"github.com/besednjak/draftea-payments-challenge/internal/application/ports"
 	"github.com/besednjak/draftea-payments-challenge/internal/domain/events"
 	"github.com/besednjak/draftea-payments-challenge/internal/domain/payment"
+	"github.com/besednjak/draftea-payments-challenge/internal/observability"
 )
 
 const (
@@ -35,6 +37,8 @@ type Config struct {
 	Logger          *slog.Logger
 	SyncReserveWait time.Duration
 	MaxLockRetries  int
+	LockRetryMin    time.Duration
+	LockRetryMax    time.Duration
 	Clock           events.Clock
 	IDGenerator     events.IDGenerator
 }
@@ -85,6 +89,8 @@ type PaymentOrchestrator struct {
 	logger          *slog.Logger
 	syncReserveWait time.Duration
 	maxLockRetries  int
+	lockRetryMin    time.Duration
+	lockRetryMax    time.Duration
 	clock           events.Clock
 	idGen           events.IDGenerator
 
@@ -102,6 +108,12 @@ func NewPaymentOrchestrator(cfg Config) *PaymentOrchestrator {
 	}
 	if cfg.MaxLockRetries <= 0 {
 		cfg.MaxLockRetries = 5
+	}
+	if cfg.LockRetryMin <= 0 {
+		cfg.LockRetryMin = 2 * time.Millisecond
+	}
+	if cfg.LockRetryMax <= 0 {
+		cfg.LockRetryMax = 15 * time.Millisecond
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewJSONHandler(io.Discard, nil))
@@ -123,6 +135,8 @@ func NewPaymentOrchestrator(cfg Config) *PaymentOrchestrator {
 		logger:          cfg.Logger,
 		syncReserveWait: cfg.SyncReserveWait,
 		maxLockRetries:  cfg.MaxLockRetries,
+		lockRetryMin:    cfg.LockRetryMin,
+		lockRetryMax:    cfg.LockRetryMax,
 		clock:           cfg.Clock,
 		idGen:           cfg.IDGenerator,
 		waiters:         make(map[string]chan reserveOutcome),
@@ -134,11 +148,11 @@ func NewPaymentOrchestrator(cfg Config) *PaymentOrchestrator {
 // and waits up to SyncReserveWait (default 2s) to return an immediate 422 on insufficient funds
 // or 202 Accepted with the updated available balance.
 func (o *PaymentOrchestrator) InitiatePayment(ctx context.Context, req InitiatePaymentRequest) (InitiatePaymentResult, error) {
-	reqHash := hashInitiateRequest(req)
-	idempReserved := false
+	requestHash := hashInitiateRequest(req)
+	idempotencyReserved := false
 
 	if o.idempotency != nil && req.IdempotencyKey != "" {
-		existing, reserved, err := o.idempotency.Reserve(ctx, req.UserID, req.IdempotencyKey, reqHash, 24*time.Hour)
+		existing, reserved, err := o.idempotency.Reserve(ctx, req.UserID, req.IdempotencyKey, requestHash, 24*time.Hour)
 		if err != nil {
 			return InitiatePaymentResult{}, err
 		}
@@ -150,15 +164,16 @@ func (o *PaymentOrchestrator) InitiatePayment(ctx context.Context, req InitiateP
 			cached.FromIdempotencyCache = true
 			return cached, nil
 		}
-		idempReserved = true
+		idempotencyReserved = true
 	}
 
 	paymentID := req.PaymentID
 	if paymentID == "" {
 		paymentID = "pay_" + o.idGen()
 	}
+	ctx = observability.WithCorrelation(ctx, paymentID, paymentID, req.WalletID)
 
-	p, err := payment.Initiate(
+	initiated, err := payment.Initiate(
 		payment.InitiateParams{
 			PaymentID: paymentID,
 			WalletID:  req.WalletID,
@@ -172,36 +187,50 @@ func (o *PaymentOrchestrator) InitiatePayment(ctx context.Context, req InitiateP
 		payment.WithIDGenerator(o.idGen),
 	)
 	if err != nil {
-		if idempReserved {
+		if idempotencyReserved {
 			_ = o.idempotency.Delete(ctx, req.UserID, req.IdempotencyKey)
 		}
 		return InitiatePaymentResult{}, err
 	}
 
-	uncommitted := p.UncommittedEvents()
-	if err := o.store.Append(ctx, p.StreamID(), 0, uncommitted...); err != nil {
-		if idempReserved {
+	uncommitted := initiated.UncommittedEvents()
+	if err := o.store.Append(ctx, initiated.StreamID(), 0, uncommitted...); err != nil {
+		if idempotencyReserved {
 			_ = o.idempotency.Delete(ctx, req.UserID, req.IdempotencyKey)
 		}
 		return InitiatePaymentResult{}, err
 	}
-	p.ClearUncommitted()
-	_ = o.syncPaymentView(ctx, p, uncommitted[0].OccurredAt)
+	initiated.ClearUncommitted()
+	_ = o.syncPaymentView(ctx, initiated, uncommitted[0].OccurredAt)
 
-	if err := o.publishPaymentEvents(ctx, p.ID(), uncommitted); err != nil {
+	if err := o.publishPaymentEvents(ctx, initiated.ID(), uncommitted); err != nil {
 		return InitiatePaymentResult{}, err
 	}
 
-	// Register waiter BEFORE dispatching ReserveFunds to eliminate missed signals.
-	waitCh := o.registerWaiter(p.ID())
-	defer o.unregisterWaiter(p.ID())
+	// Register waiter before dispatching ReserveFunds to eliminate missed signals.
+	waitCh := o.registerWaiter(initiated.ID())
+	defer o.unregisterWaiter(initiated.ID())
 
-	if err := o.emitReserveFunds(ctx, p, uncommitted[0].EventID); err != nil {
+	if err := o.publishCommand(
+		ctx,
+		events.TopicWalletsCommands,
+		initiated.WalletID(),
+		events.CommandReserveFunds,
+		events.AggregateTypeWallet,
+		initiated.WalletID(),
+		initiated.ID(),
+		uncommitted[0].EventID,
+		events.ReserveFundsCommand{
+			PaymentID: initiated.ID(),
+			WalletID:  initiated.WalletID(),
+			Amount:    initiated.Amount(),
+		},
+	); err != nil {
 		return InitiatePaymentResult{}, err
 	}
 
 	result := InitiatePaymentResult{
-		PaymentID:  p.ID(),
+		PaymentID:  initiated.ID(),
 		Status:     payment.StatusPending,
 		HTTPStatus: http.StatusAccepted,
 	}
@@ -221,14 +250,12 @@ func (o *PaymentOrchestrator) InitiatePayment(ctx context.Context, req InitiateP
 			result.HTTPStatus = http.StatusUnprocessableEntity
 		}
 	case <-timer.C:
-		// Bounded 2s wait elapsed: return 202 Accepted (PENDING) so client polls GET /v1/payments/{id}.
 	case <-ctx.Done():
-		// Caller cancelled/timed out: payment continues asynchronously.
 	}
 
-	if idempReserved {
-		if raw, err := json.Marshal(result); err == nil {
-			_ = o.idempotency.Complete(ctx, req.UserID, req.IdempotencyKey, p.ID(), raw)
+	if idempotencyReserved {
+		if encoded, err := json.Marshal(result); err == nil {
+			_ = o.idempotency.Complete(ctx, req.UserID, req.IdempotencyKey, initiated.ID(), encoded)
 		}
 	}
 
@@ -240,11 +267,11 @@ func (o *PaymentOrchestrator) GetPayment(ctx context.Context, paymentID string) 
 	if o.views != nil {
 		return o.views.Get(ctx, paymentID)
 	}
-	p, err := o.Load(ctx, paymentID)
+	loaded, err := o.Load(ctx, paymentID)
 	if err != nil {
 		return ports.PaymentView{}, err
 	}
-	return toPaymentView(p, o.clock().UTC()), nil
+	return toPaymentView(loaded, o.clock().UTC()), nil
 }
 
 // Load rehydrates a Payment aggregate directly from the Event Store.
@@ -262,65 +289,88 @@ func (o *PaymentOrchestrator) Load(ctx context.Context, paymentID string) (*paym
 }
 
 // HandleWalletEvent consumes wallets.events.v1 to drive saga steps.
-func (o *PaymentOrchestrator) HandleWalletEvent(ctx context.Context, env events.Envelope) error {
+func (o *PaymentOrchestrator) HandleWalletEvent(ctx context.Context, env events.Envelope) (retErr error) {
 	if o.inbox != nil && env.EventID != "" {
-		dup, err := o.inbox.TryMarkProcessed(ctx, walletConsumerGroup, env.EventID)
+		alreadyProcessed, err := o.inbox.TryMarkProcessed(ctx, walletConsumerGroup, env.EventID)
 		if err != nil {
 			return err
 		}
-		if dup {
+		if alreadyProcessed {
 			return nil
 		}
+		defer func() {
+			if retErr != nil {
+				_ = o.inbox.UnmarkProcessed(ctx, walletConsumerGroup, env.EventID)
+			}
+		}()
 	}
 
 	switch env.Type {
 	case events.EventFundsReserved:
-		d, err := events.DecodePayload[events.FundsReservedPayload](env)
+		payload, err := events.DecodePayload[events.FundsReservedPayload](env)
 		if err != nil {
-			return err
+			return ports.NonRetryable(err)
 		}
-		meta := events.Metadata{CorrelationID: d.PaymentID, CausationID: env.EventID}
-		p, transitioned, err := o.mutatePayment(ctx, d.PaymentID, func(p *payment.Payment) error {
+		ctx = observability.WithCorrelation(ctx, payload.PaymentID, payload.PaymentID, env.AggregateID)
+		meta := events.Metadata{CorrelationID: payload.PaymentID, CausationID: env.EventID}
+		updated, transitioned, err := o.mutatePayment(ctx, payload.PaymentID, func(p *payment.Payment) error {
 			if p.Status() != payment.StatusPending {
 				return nil
 			}
-			return p.MarkFundsReserved(d.AvailableAfter, meta)
+			return p.MarkFundsReserved(payload.AvailableAfter, meta)
 		})
 		if err != nil {
 			return err
 		}
-		o.notifyWaiter(d.PaymentID, reserveOutcome{reserved: true, availableAfter: d.AvailableAfter})
+		o.notifyWaiter(payload.PaymentID, reserveOutcome{reserved: true, availableAfter: payload.AvailableAfter})
 		if transitioned {
-			return o.emitSubmitPayment(ctx, p, env.EventID)
+			return o.publishCommand(
+				ctx,
+				events.TopicGatewayCommands,
+				updated.ID(),
+				events.CommandSubmitPayment,
+				events.AggregateTypeGateway,
+				updated.ID(),
+				updated.ID(),
+				env.EventID,
+				events.SubmitPaymentCommand{
+					PaymentID: updated.ID(),
+					Provider:  updated.Provider(),
+					ServiceID: updated.ServiceID(),
+					Amount:    updated.Amount(),
+				},
+			)
 		}
 		return nil
 
 	case events.EventFundsReservationRejected:
-		d, err := events.DecodePayload[events.FundsReservationRejectedPayload](env)
+		payload, err := events.DecodePayload[events.FundsReservationRejectedPayload](env)
 		if err != nil {
-			return err
+			return ports.NonRetryable(err)
 		}
-		meta := events.Metadata{CorrelationID: d.PaymentID, CausationID: env.EventID}
-		_, _, err = o.mutatePayment(ctx, d.PaymentID, func(p *payment.Payment) error {
+		ctx = observability.WithCorrelation(ctx, payload.PaymentID, payload.PaymentID, env.AggregateID)
+		meta := events.Metadata{CorrelationID: payload.PaymentID, CausationID: env.EventID}
+		_, _, err = o.mutatePayment(ctx, payload.PaymentID, func(p *payment.Payment) error {
 			if p.Status() != payment.StatusPending {
 				return nil
 			}
-			return p.MarkRejected(d.Reason, meta)
+			return p.MarkRejected(payload.Reason, meta)
 		})
 		if err != nil {
 			return err
 		}
-		o.notifyWaiter(d.PaymentID, reserveOutcome{reserved: false, reason: d.Reason})
+		o.notifyWaiter(payload.PaymentID, reserveOutcome{reserved: false, reason: payload.Reason})
 		return nil
 
 	case events.EventFundsCaptured:
-		d, err := events.DecodePayload[events.FundsCapturedPayload](env)
+		payload, err := events.DecodePayload[events.FundsCapturedPayload](env)
 		if err != nil {
-			return err
+			return ports.NonRetryable(err)
 		}
-		providerRef := o.popApprovedRef(d.PaymentID)
-		meta := events.Metadata{CorrelationID: d.PaymentID, CausationID: env.EventID}
-		_, _, err = o.mutatePayment(ctx, d.PaymentID, func(p *payment.Payment) error {
+		ctx = observability.WithCorrelation(ctx, payload.PaymentID, payload.PaymentID, env.AggregateID)
+		providerRef := o.popApprovedRef(payload.PaymentID)
+		meta := events.Metadata{CorrelationID: payload.PaymentID, CausationID: env.EventID}
+		_, _, err = o.mutatePayment(ctx, payload.PaymentID, func(p *payment.Payment) error {
 			if p.Status() == payment.StatusCompleted || p.Status() == payment.StatusRefunded {
 				return nil
 			}
@@ -329,27 +379,29 @@ func (o *PaymentOrchestrator) HandleWalletEvent(ctx context.Context, env events.
 		return err
 
 	case events.EventFundsReleased:
-		d, err := events.DecodePayload[events.FundsReleasedPayload](env)
+		payload, err := events.DecodePayload[events.FundsReleasedPayload](env)
 		if err != nil {
-			return err
+			return ports.NonRetryable(err)
 		}
-		meta := events.Metadata{CorrelationID: d.PaymentID, CausationID: env.EventID}
-		_, _, err = o.mutatePayment(ctx, d.PaymentID, func(p *payment.Payment) error {
+		ctx = observability.WithCorrelation(ctx, payload.PaymentID, payload.PaymentID, env.AggregateID)
+		meta := events.Metadata{CorrelationID: payload.PaymentID, CausationID: env.EventID}
+		_, _, err = o.mutatePayment(ctx, payload.PaymentID, func(p *payment.Payment) error {
 			if p.Status() == payment.StatusFailed || p.Status() == payment.StatusRejected {
 				return nil
 			}
-			return p.MarkFailed(d.Reason, meta)
+			return p.MarkFailed(payload.Reason, meta)
 		})
 		return err
 
 	case events.EventFundsRefunded:
-		d, err := events.DecodePayload[events.FundsRefundedPayload](env)
+		payload, err := events.DecodePayload[events.FundsRefundedPayload](env)
 		if err != nil {
-			return err
+			return ports.NonRetryable(err)
 		}
-		meta := events.Metadata{CorrelationID: d.PaymentID, CausationID: env.EventID}
-		_, _, err = o.mutatePayment(ctx, d.PaymentID, func(p *payment.Payment) error {
-			return p.RecordRefund(d.RefundID, d.Amount, meta)
+		ctx = observability.WithCorrelation(ctx, payload.PaymentID, payload.PaymentID, env.AggregateID)
+		meta := events.Metadata{CorrelationID: payload.PaymentID, CausationID: env.EventID}
+		_, _, err = o.mutatePayment(ctx, payload.PaymentID, func(p *payment.Payment) error {
+			return p.RecordRefund(payload.RefundID, payload.Amount, meta)
 		})
 		return err
 
@@ -359,123 +411,188 @@ func (o *PaymentOrchestrator) HandleWalletEvent(ctx context.Context, env events.
 }
 
 // HandleGatewayEvent consumes gateway.events.v1 to react to provider outcomes.
-func (o *PaymentOrchestrator) HandleGatewayEvent(ctx context.Context, env events.Envelope) error {
+func (o *PaymentOrchestrator) HandleGatewayEvent(ctx context.Context, env events.Envelope) (retErr error) {
 	if o.inbox != nil && env.EventID != "" {
-		dup, err := o.inbox.TryMarkProcessed(ctx, gatewayConsumerGroup, env.EventID)
+		alreadyProcessed, err := o.inbox.TryMarkProcessed(ctx, gatewayConsumerGroup, env.EventID)
 		if err != nil {
 			return err
 		}
-		if dup {
+		if alreadyProcessed {
 			return nil
 		}
+		defer func() {
+			if retErr != nil {
+				_ = o.inbox.UnmarkProcessed(ctx, gatewayConsumerGroup, env.EventID)
+			}
+		}()
 	}
 
 	switch env.Type {
 	case events.EventGatewaySubmissionAccepted:
-		d, err := events.DecodePayload[events.GatewaySubmissionAcceptedPayload](env)
+		payload, err := events.DecodePayload[events.GatewaySubmissionAcceptedPayload](env)
 		if err != nil {
-			return err
+			return ports.NonRetryable(err)
 		}
-		meta := events.Metadata{CorrelationID: d.PaymentID, CausationID: env.EventID}
-		_, _, err = o.mutatePayment(ctx, d.PaymentID, func(p *payment.Payment) error {
+		ctx = observability.WithCorrelation(ctx, payload.PaymentID, payload.PaymentID, "")
+		meta := events.Metadata{CorrelationID: payload.PaymentID, CausationID: env.EventID}
+		_, _, err = o.mutatePayment(ctx, payload.PaymentID, func(p *payment.Payment) error {
 			if p.Status() != payment.StatusFundsReserved {
 				return nil
 			}
-			return p.MarkSubmitted(d.ProviderRef, meta)
+			return p.MarkSubmitted(payload.ProviderRef, meta)
 		})
 		return err
 
 	case events.EventGatewaySubmissionNotSent:
-		d, err := events.DecodePayload[events.GatewaySubmissionNotSentPayload](env)
+		payload, err := events.DecodePayload[events.GatewaySubmissionNotSentPayload](env)
+		if err != nil {
+			return ports.NonRetryable(err)
+		}
+		loaded, err := o.Load(ctx, payload.PaymentID)
 		if err != nil {
 			return err
 		}
-		p, err := o.Load(ctx, d.PaymentID)
-		if err != nil {
-			return err
-		}
-		if p.Status().IsTerminal() || p.Status() == payment.StatusCompleted {
+		if loaded.Status().IsTerminal() || loaded.Status() == payment.StatusCompleted {
 			return nil
 		}
-		// Certainty of non-delivery -> safe to compensate by releasing held funds.
-		return o.emitReleaseFunds(ctx, p, d.Reason, env.EventID)
+		ctx = observability.WithCorrelation(ctx, loaded.ID(), loaded.ID(), loaded.WalletID())
+		return o.publishCommand(
+			ctx,
+			events.TopicWalletsCommands,
+			loaded.WalletID(),
+			events.CommandReleaseFunds,
+			events.AggregateTypeWallet,
+			loaded.WalletID(),
+			loaded.ID(),
+			env.EventID,
+			events.ReleaseFundsCommand{
+				PaymentID: loaded.ID(),
+				WalletID:  loaded.WalletID(),
+				Reason:    payload.Reason,
+			},
+		)
 
 	case events.EventGatewayOutcomeUnknown:
-		d, err := events.DecodePayload[events.GatewayOutcomeUnknownPayload](env)
+		payload, err := events.DecodePayload[events.GatewayOutcomeUnknownPayload](env)
 		if err != nil {
-			return err
+			return ports.NonRetryable(err)
 		}
-		meta := events.Metadata{CorrelationID: d.PaymentID, CausationID: env.EventID}
-		_, _, err = o.mutatePayment(ctx, d.PaymentID, func(p *payment.Payment) error {
+		ctx = observability.WithCorrelation(ctx, payload.PaymentID, payload.PaymentID, "")
+		meta := events.Metadata{CorrelationID: payload.PaymentID, CausationID: env.EventID}
+		_, _, err = o.mutatePayment(ctx, payload.PaymentID, func(p *payment.Payment) error {
 			if p.Status() == payment.StatusGatewayUnknown || p.Status() == payment.StatusCompleted || p.Status().IsTerminal() {
 				return nil
 			}
-			return p.MarkGatewayUnknown(d.Reason, meta)
+			return p.MarkGatewayUnknown(payload.Reason, meta)
 		})
 		return err
 
 	case events.EventGatewayPaymentApproved:
-		d, err := events.DecodePayload[events.GatewayPaymentApprovedPayload](env)
+		payload, err := events.DecodePayload[events.GatewayPaymentApprovedPayload](env)
+		if err != nil {
+			return ports.NonRetryable(err)
+		}
+		loaded, err := o.Load(ctx, payload.PaymentID)
 		if err != nil {
 			return err
 		}
-		p, err := o.Load(ctx, d.PaymentID)
-		if err != nil {
-			return err
-		}
-		if p.Status() == payment.StatusCompleted || p.Status() == payment.StatusRefunded {
+		if loaded.Status() == payment.StatusCompleted || loaded.Status() == payment.StatusRefunded {
 			return nil
 		}
-		o.storeApprovedRef(d.PaymentID, d.ProviderRef)
-		// Point of no return reached -> advance forward by capturing held funds.
-		return o.emitCaptureFunds(ctx, p, env.EventID)
+		o.storeApprovedRef(payload.PaymentID, payload.ProviderRef)
+		ctx = observability.WithCorrelation(ctx, loaded.ID(), loaded.ID(), loaded.WalletID())
+		return o.publishCommand(
+			ctx,
+			events.TopicWalletsCommands,
+			loaded.WalletID(),
+			events.CommandCaptureFunds,
+			events.AggregateTypeWallet,
+			loaded.WalletID(),
+			loaded.ID(),
+			env.EventID,
+			events.CaptureFundsCommand{
+				PaymentID: loaded.ID(),
+				WalletID:  loaded.WalletID(),
+				Amount:    loaded.Amount(),
+			},
+		)
 
 	case events.EventGatewayPaymentDeclined:
-		d, err := events.DecodePayload[events.GatewayPaymentDeclinedPayload](env)
+		payload, err := events.DecodePayload[events.GatewayPaymentDeclinedPayload](env)
+		if err != nil {
+			return ports.NonRetryable(err)
+		}
+		loaded, err := o.Load(ctx, payload.PaymentID)
 		if err != nil {
 			return err
 		}
-		p, err := o.Load(ctx, d.PaymentID)
-		if err != nil {
-			return err
-		}
-		if p.Status().IsTerminal() || p.Status() == payment.StatusCompleted {
+		if loaded.Status().IsTerminal() || loaded.Status() == payment.StatusCompleted {
 			return nil
 		}
-		// Negative evidence from provider -> compensate by releasing held funds.
-		return o.emitReleaseFunds(ctx, p, d.Reason, env.EventID)
+		ctx = observability.WithCorrelation(ctx, loaded.ID(), loaded.ID(), loaded.WalletID())
+		return o.publishCommand(
+			ctx,
+			events.TopicWalletsCommands,
+			loaded.WalletID(),
+			events.CommandReleaseFunds,
+			events.AggregateTypeWallet,
+			loaded.WalletID(),
+			loaded.ID(),
+			env.EventID,
+			events.ReleaseFundsCommand{
+				PaymentID: loaded.ID(),
+				WalletID:  loaded.WalletID(),
+				Reason:    payload.Reason,
+			},
+		)
 
 	case events.EventGatewayStatusPending:
-		d, err := events.DecodePayload[events.GatewayStatusPendingPayload](env)
+		payload, err := events.DecodePayload[events.GatewayStatusPendingPayload](env)
 		if err != nil {
-			return err
+			return ports.NonRetryable(err)
 		}
-		o.logger.Info("reconciliation check still pending at provider",
-			"correlation_id", d.PaymentID,
-			"provider", d.Provider,
+		ctx = observability.WithCorrelation(ctx, payload.PaymentID, payload.PaymentID, "")
+		observability.LoggerFromContext(ctx, o.logger).Info("reconciliation check still pending at provider",
+			"provider", payload.Provider,
 		)
 		return nil
 
 	case events.EventGatewayRefundApproved:
-		d, err := events.DecodePayload[events.GatewayRefundApprovedPayload](env)
+		payload, err := events.DecodePayload[events.GatewayRefundApprovedPayload](env)
+		if err != nil {
+			return ports.NonRetryable(err)
+		}
+		loaded, err := o.Load(ctx, payload.PaymentID)
 		if err != nil {
 			return err
 		}
-		p, err := o.Load(ctx, d.PaymentID)
-		if err != nil {
-			return err
-		}
-		return o.emitRefundFunds(ctx, p, d.RefundID, d.Amount, env.EventID)
+		ctx = observability.WithCorrelation(ctx, loaded.ID(), loaded.ID(), loaded.WalletID())
+		return o.publishCommand(
+			ctx,
+			events.TopicWalletsCommands,
+			loaded.WalletID(),
+			events.CommandRefundFunds,
+			events.AggregateTypeWallet,
+			loaded.WalletID(),
+			loaded.ID(),
+			env.EventID,
+			events.RefundFundsCommand{
+				PaymentID: loaded.ID(),
+				RefundID:  payload.RefundID,
+				WalletID:  loaded.WalletID(),
+				Amount:    payload.Amount,
+			},
+		)
 
 	case events.EventGatewayRefundDeclined:
-		d, err := events.DecodePayload[events.GatewayRefundDeclinedPayload](env)
+		payload, err := events.DecodePayload[events.GatewayRefundDeclinedPayload](env)
 		if err != nil {
-			return err
+			return ports.NonRetryable(err)
 		}
-		o.logger.Warn("gateway declined refund request",
-			"correlation_id", d.PaymentID,
-			"refund_id", d.RefundID,
-			"reason", d.Reason,
+		ctx = observability.WithCorrelation(ctx, payload.PaymentID, payload.PaymentID, "")
+		observability.LoggerFromContext(ctx, o.logger).Warn("gateway declined refund request",
+			"refund_id", payload.RefundID,
+			"reason", payload.Reason,
 		)
 		return nil
 
@@ -486,31 +603,47 @@ func (o *PaymentOrchestrator) HandleGatewayEvent(ctx context.Context, env events
 
 // TriggerReconciliation dispatches CheckPaymentStatus for an uncertain or stalled payment.
 func (o *PaymentOrchestrator) TriggerReconciliation(ctx context.Context, paymentID string) error {
-	p, err := o.Load(ctx, paymentID)
+	loaded, err := o.Load(ctx, paymentID)
 	if err != nil {
 		return err
 	}
-	if p.Status() == payment.StatusSubmitted {
+	ctx = observability.WithCorrelation(ctx, loaded.ID(), loaded.ID(), loaded.WalletID())
+
+	if loaded.Status() == payment.StatusSubmitted {
 		meta := events.Metadata{CorrelationID: paymentID}
-		p, _, err = o.mutatePayment(ctx, paymentID, func(cur *payment.Payment) error {
-			if cur.Status() != payment.StatusSubmitted {
+		loaded, _, err = o.mutatePayment(ctx, paymentID, func(current *payment.Payment) error {
+			if current.Status() != payment.StatusSubmitted {
 				return nil
 			}
-			return cur.MarkGatewayUnknown("WEBHOOK_TIMEOUT", meta)
+			return current.MarkGatewayUnknown("WEBHOOK_TIMEOUT", meta)
 		})
 		if err != nil {
 			return err
 		}
 	}
-	if p.Status() != payment.StatusGatewayUnknown {
-		return fmt.Errorf("%w: cannot reconcile payment in status %s", payment.ErrInvalidTransition, p.Status())
+	if loaded.Status() != payment.StatusGatewayUnknown {
+		return fmt.Errorf("%w: cannot reconcile payment in status %s", payment.ErrInvalidTransition, loaded.Status())
 	}
-	return o.emitCheckPaymentStatus(ctx, p, "")
+	return o.publishCommand(
+		ctx,
+		events.TopicGatewayCommands,
+		loaded.ID(),
+		events.CommandCheckPaymentStatus,
+		events.AggregateTypeGateway,
+		loaded.ID(),
+		loaded.ID(),
+		"",
+		events.CheckPaymentStatusCommand{
+			PaymentID: loaded.ID(),
+			Provider:  loaded.Provider(),
+		},
+	)
 }
 
 // ExpireReconciliationWindow moves a GATEWAY_UNKNOWN payment into MANUAL_REVIEW while
 // keeping funds safely held until operations resolves it.
 func (o *PaymentOrchestrator) ExpireReconciliationWindow(ctx context.Context, paymentID string) error {
+	ctx = observability.WithCorrelation(ctx, paymentID, paymentID, "")
 	meta := events.Metadata{CorrelationID: paymentID}
 	_, _, err := o.mutatePayment(ctx, paymentID, func(p *payment.Payment) error {
 		return p.MarkManualReview(events.ReasonReconcileExpired, meta)
@@ -520,21 +653,51 @@ func (o *PaymentOrchestrator) ExpireReconciliationWindow(ctx context.Context, pa
 
 // ResolveManualReview resolves a MANUAL_REVIEW payment based on provider settlement evidence.
 func (o *PaymentOrchestrator) ResolveManualReview(ctx context.Context, paymentID string, approved bool, providerRef, reason string) error {
-	p, err := o.Load(ctx, paymentID)
+	loaded, err := o.Load(ctx, paymentID)
 	if err != nil {
 		return err
 	}
-	if p.Status() != payment.StatusManualReview {
-		return fmt.Errorf("%w: payment is in status %s, expected MANUAL_REVIEW", payment.ErrInvalidTransition, p.Status())
+	if loaded.Status() != payment.StatusManualReview {
+		return fmt.Errorf("%w: payment is in status %s, expected MANUAL_REVIEW", payment.ErrInvalidTransition, loaded.Status())
 	}
+	ctx = observability.WithCorrelation(ctx, loaded.ID(), loaded.ID(), loaded.WalletID())
+
 	if approved {
 		o.storeApprovedRef(paymentID, providerRef)
-		return o.emitCaptureFunds(ctx, p, "")
+		return o.publishCommand(
+			ctx,
+			events.TopicWalletsCommands,
+			loaded.WalletID(),
+			events.CommandCaptureFunds,
+			events.AggregateTypeWallet,
+			loaded.WalletID(),
+			loaded.ID(),
+			"",
+			events.CaptureFundsCommand{
+				PaymentID: loaded.ID(),
+				WalletID:  loaded.WalletID(),
+				Amount:    loaded.Amount(),
+			},
+		)
 	}
 	if reason == "" {
 		reason = "MANUAL_REVIEW_DECLINED"
 	}
-	return o.emitReleaseFunds(ctx, p, reason, "")
+	return o.publishCommand(
+		ctx,
+		events.TopicWalletsCommands,
+		loaded.WalletID(),
+		events.CommandReleaseFunds,
+		events.AggregateTypeWallet,
+		loaded.WalletID(),
+		loaded.ID(),
+		"",
+		events.ReleaseFundsCommand{
+			PaymentID: loaded.ID(),
+			WalletID:  loaded.WalletID(),
+			Reason:    reason,
+		},
+	)
 }
 
 // RequestRefund validates refund invariants on a COMPLETED payment and emits RefundPayment.
@@ -547,21 +710,38 @@ func (o *PaymentOrchestrator) RequestRefund(ctx context.Context, paymentID, refu
 		return err
 	}
 
-	p, err := o.Load(ctx, paymentID)
+	loaded, err := o.Load(ctx, paymentID)
 	if err != nil {
 		return err
 	}
-	if p.Status() != payment.StatusCompleted {
-		return fmt.Errorf("%w: cannot refund payment in status %s", payment.ErrInvalidTransition, p.Status())
+	if loaded.Status() != payment.StatusCompleted {
+		return fmt.Errorf("%w: cannot refund payment in status %s", payment.ErrInvalidTransition, loaded.Status())
 	}
-	if money.Currency != p.Amount().Currency {
-		return fmt.Errorf("%w: payment=%s refund=%s", payment.ErrCurrencyMismatch, p.Amount().Currency, money.Currency)
+	if money.Currency != loaded.Amount().Currency {
+		return fmt.Errorf("%w: payment=%s refund=%s", payment.ErrCurrencyMismatch, loaded.Amount().Currency, money.Currency)
 	}
-	if money.Amount > p.RefundableAmount() {
-		return fmt.Errorf("%w: refundable=%d requested=%d", payment.ErrRefundExceedsCaptured, p.RefundableAmount(), money.Amount)
+	if money.Amount > loaded.RefundableAmount() {
+		return fmt.Errorf("%w: refundable=%d requested=%d", payment.ErrRefundExceedsCaptured, loaded.RefundableAmount(), money.Amount)
 	}
 
-	return o.emitRefundPayment(ctx, p, refundID, money)
+	ctx = observability.WithCorrelation(ctx, loaded.ID(), loaded.ID(), loaded.WalletID())
+	return o.publishCommand(
+		ctx,
+		events.TopicGatewayCommands,
+		loaded.ID(),
+		events.CommandRefundPayment,
+		events.AggregateTypeGateway,
+		loaded.ID(),
+		loaded.ID(),
+		"",
+		events.RefundPaymentCommand{
+			PaymentID:   loaded.ID(),
+			RefundID:    refundID,
+			Provider:    loaded.Provider(),
+			ProviderRef: loaded.ProviderRef(),
+			Amount:      money,
+		},
+	)
 }
 
 // RecoverActiveSagas scans all persisted Payment streams in the Event Store,
@@ -578,43 +758,81 @@ func (o *PaymentOrchestrator) RecoverActiveSagas(ctx context.Context) (RecoveryS
 
 	for _, streamID := range streamIDs {
 		paymentID := strings.TrimPrefix(streamID, prefix)
-		p, err := o.Load(ctx, paymentID)
+		loaded, err := o.Load(ctx, paymentID)
 		if err != nil {
 			return summary, fmt.Errorf("rehydrate %s during recovery: %w", streamID, err)
 		}
 		summary.Scanned++
 
-		if !p.Status().IsActiveSaga() {
+		if !loaded.Status().IsActiveSaga() {
 			continue
 		}
 
-		switch p.Status() {
+		sagaCtx := observability.WithCorrelation(ctx, loaded.ID(), loaded.ID(), loaded.WalletID())
+
+		switch loaded.Status() {
 		case payment.StatusPending:
-			if err := o.emitReserveFunds(ctx, p, "recovery"); err != nil {
-				return summary, err
-			}
+			err = o.publishCommand(
+				sagaCtx,
+				events.TopicWalletsCommands,
+				loaded.WalletID(),
+				events.CommandReserveFunds,
+				events.AggregateTypeWallet,
+				loaded.WalletID(),
+				loaded.ID(),
+				"recovery",
+				events.ReserveFundsCommand{
+					PaymentID: loaded.ID(),
+					WalletID:  loaded.WalletID(),
+					Amount:    loaded.Amount(),
+				},
+			)
 		case payment.StatusFundsReserved:
-			if err := o.emitSubmitPayment(ctx, p, "recovery"); err != nil {
-				return summary, err
-			}
+			err = o.publishCommand(
+				sagaCtx,
+				events.TopicGatewayCommands,
+				loaded.ID(),
+				events.CommandSubmitPayment,
+				events.AggregateTypeGateway,
+				loaded.ID(),
+				loaded.ID(),
+				"recovery",
+				events.SubmitPaymentCommand{
+					PaymentID: loaded.ID(),
+					Provider:  loaded.Provider(),
+					ServiceID: loaded.ServiceID(),
+					Amount:    loaded.Amount(),
+				},
+			)
 		case payment.StatusSubmitted, payment.StatusGatewayUnknown:
-			if err := o.emitCheckPaymentStatus(ctx, p, "recovery"); err != nil {
-				return summary, err
-			}
+			err = o.publishCommand(
+				sagaCtx,
+				events.TopicGatewayCommands,
+				loaded.ID(),
+				events.CommandCheckPaymentStatus,
+				events.AggregateTypeGateway,
+				loaded.ID(),
+				loaded.ID(),
+				"recovery",
+				events.CheckPaymentStatusCommand{
+					PaymentID: loaded.ID(),
+					Provider:  loaded.Provider(),
+				},
+			)
+		}
+		if err != nil {
+			return summary, err
 		}
 
 		summary.Resumed++
-		summary.ByStatus[p.Status()]++
-		o.logger.Info("recovered active payment saga",
-			"payment_id", p.ID(),
-			"status", string(p.Status()),
+		summary.ByStatus[loaded.Status()]++
+		observability.LoggerFromContext(sagaCtx, o.logger).Info("recovered active payment saga",
+			"status", string(loaded.Status()),
 		)
 	}
 
 	return summary, nil
 }
-
-// --- Internal helpers ---
 
 func (o *PaymentOrchestrator) mutatePayment(
 	ctx context.Context,
@@ -623,27 +841,27 @@ func (o *PaymentOrchestrator) mutatePayment(
 ) (*payment.Payment, bool, error) {
 	var lastErr error
 	for attempt := 0; attempt < o.maxLockRetries; attempt++ {
-		p, err := o.Load(ctx, paymentID)
+		loaded, err := o.Load(ctx, paymentID)
 		if err != nil {
 			return nil, false, err
 		}
-		if err := mutate(p); err != nil {
+		if err := mutate(loaded); err != nil {
 			return nil, false, err
 		}
 
-		uncommitted := p.UncommittedEvents()
+		uncommitted := loaded.UncommittedEvents()
 		if len(uncommitted) == 0 {
-			return p, false, nil
+			return loaded, false, nil
 		}
 
-		err = o.store.Append(ctx, p.StreamID(), p.BaseVersion(), uncommitted...)
+		err = o.store.Append(ctx, loaded.StreamID(), loaded.BaseVersion(), uncommitted...)
 		if err == nil {
-			p.ClearUncommitted()
-			_ = o.syncPaymentView(ctx, p, uncommitted[len(uncommitted)-1].OccurredAt)
-			if err := o.publishPaymentEvents(ctx, p.ID(), uncommitted); err != nil {
+			loaded.ClearUncommitted()
+			_ = o.syncPaymentView(ctx, loaded, uncommitted[len(uncommitted)-1].OccurredAt)
+			if err := o.publishPaymentEvents(ctx, loaded.ID(), uncommitted); err != nil {
 				return nil, false, err
 			}
-			return p, true, nil
+			return loaded, true, nil
 		}
 		if !errors.Is(err, ports.ErrVersionConflict) {
 			return nil, false, err
@@ -653,18 +871,36 @@ func (o *PaymentOrchestrator) mutatePayment(
 		if o.metrics != nil {
 			o.metrics.RecordOptimisticLockRetry(events.AggregateTypePayment)
 		}
+		observability.LoggerFromContext(ctx, o.logger).Warn("payment optimistic lock conflict, reloading aggregate",
+			"attempt", attempt+1,
+			"max_retries", o.maxLockRetries,
+		)
+
+		if attempt+1 < o.maxLockRetries {
+			jitter := o.lockRetryMin
+			if o.lockRetryMax > o.lockRetryMin {
+				jitter += time.Duration(rand.Int64N(int64(o.lockRetryMax - o.lockRetryMin)))
+			}
+			timer := time.NewTimer(jitter)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, false, ctx.Err()
+			case <-timer.C:
+			}
+		}
 	}
 	return nil, false, fmt.Errorf("payment %s failed after %d lock retries: %w", paymentID, o.maxLockRetries, lastErr)
 }
 
-func (o *PaymentOrchestrator) syncPaymentView(ctx context.Context, p *payment.Payment, at time.Time) error {
+func (o *PaymentOrchestrator) syncPaymentView(ctx context.Context, p *payment.Payment, updatedAt time.Time) error {
 	if o.views == nil {
 		return nil
 	}
-	return o.views.Upsert(ctx, toPaymentView(p, at))
+	return o.views.Upsert(ctx, toPaymentView(p, updatedAt))
 }
 
-func toPaymentView(p *payment.Payment, at time.Time) ports.PaymentView {
+func toPaymentView(p *payment.Payment, updatedAt time.Time) ports.PaymentView {
 	return ports.PaymentView{
 		PaymentID:     p.ID(),
 		WalletID:      p.WalletID(),
@@ -678,7 +914,8 @@ func toPaymentView(p *payment.Payment, at time.Time) ports.PaymentView {
 		RefundedTotal: p.RefundedTotal(),
 		Currency:      p.Amount().Currency,
 		Version:       p.Version(),
-		UpdatedAt:     at,
+		CreatedAt:     p.CreatedAt(),
+		UpdatedAt:     updatedAt,
 	}
 }
 
@@ -694,154 +931,31 @@ func (o *PaymentOrchestrator) publishPaymentEvents(ctx context.Context, paymentI
 	return nil
 }
 
-func (o *PaymentOrchestrator) emitReserveFunds(ctx context.Context, p *payment.Payment, causationID string) error {
+func (o *PaymentOrchestrator) publishCommand(
+	ctx context.Context,
+	topic string,
+	partitionKey string,
+	commandType string,
+	aggregateType string,
+	aggregateID string,
+	correlationID string,
+	causationID string,
+	payload any,
+) error {
 	env, err := events.NewEnvelope(
-		events.CommandReserveFunds,
-		events.AggregateTypeWallet,
-		p.WalletID(),
+		commandType,
+		aggregateType,
+		aggregateID,
 		0,
-		events.ReserveFundsCommand{
-			PaymentID: p.ID(),
-			WalletID:  p.WalletID(),
-			Amount:    p.Amount(),
-		},
-		events.Metadata{CorrelationID: p.ID(), CausationID: causationID},
+		payload,
+		events.Metadata{CorrelationID: correlationID, CausationID: causationID},
 		o.clock,
 		o.idGen,
 	)
 	if err != nil {
 		return err
 	}
-	return o.publisher.Publish(ctx, events.TopicWalletsCommands, p.WalletID(), env)
-}
-
-func (o *PaymentOrchestrator) emitCaptureFunds(ctx context.Context, p *payment.Payment, causationID string) error {
-	env, err := events.NewEnvelope(
-		events.CommandCaptureFunds,
-		events.AggregateTypeWallet,
-		p.WalletID(),
-		0,
-		events.CaptureFundsCommand{
-			PaymentID: p.ID(),
-			WalletID:  p.WalletID(),
-			Amount:    p.Amount(),
-		},
-		events.Metadata{CorrelationID: p.ID(), CausationID: causationID},
-		o.clock,
-		o.idGen,
-	)
-	if err != nil {
-		return err
-	}
-	return o.publisher.Publish(ctx, events.TopicWalletsCommands, p.WalletID(), env)
-}
-
-func (o *PaymentOrchestrator) emitReleaseFunds(ctx context.Context, p *payment.Payment, reason, causationID string) error {
-	env, err := events.NewEnvelope(
-		events.CommandReleaseFunds,
-		events.AggregateTypeWallet,
-		p.WalletID(),
-		0,
-		events.ReleaseFundsCommand{
-			PaymentID: p.ID(),
-			WalletID:  p.WalletID(),
-			Reason:    reason,
-		},
-		events.Metadata{CorrelationID: p.ID(), CausationID: causationID},
-		o.clock,
-		o.idGen,
-	)
-	if err != nil {
-		return err
-	}
-	return o.publisher.Publish(ctx, events.TopicWalletsCommands, p.WalletID(), env)
-}
-
-func (o *PaymentOrchestrator) emitRefundFunds(ctx context.Context, p *payment.Payment, refundID string, amount events.Money, causationID string) error {
-	env, err := events.NewEnvelope(
-		events.CommandRefundFunds,
-		events.AggregateTypeWallet,
-		p.WalletID(),
-		0,
-		events.RefundFundsCommand{
-			PaymentID: p.ID(),
-			RefundID:  refundID,
-			WalletID:  p.WalletID(),
-			Amount:    amount,
-		},
-		events.Metadata{CorrelationID: p.ID(), CausationID: causationID},
-		o.clock,
-		o.idGen,
-	)
-	if err != nil {
-		return err
-	}
-	return o.publisher.Publish(ctx, events.TopicWalletsCommands, p.WalletID(), env)
-}
-
-func (o *PaymentOrchestrator) emitSubmitPayment(ctx context.Context, p *payment.Payment, causationID string) error {
-	env, err := events.NewEnvelope(
-		events.CommandSubmitPayment,
-		events.AggregateTypeGateway,
-		p.ID(),
-		0,
-		events.SubmitPaymentCommand{
-			PaymentID: p.ID(),
-			Provider:  p.Provider(),
-			ServiceID: p.ServiceID(),
-			Amount:    p.Amount(),
-		},
-		events.Metadata{CorrelationID: p.ID(), CausationID: causationID},
-		o.clock,
-		o.idGen,
-	)
-	if err != nil {
-		return err
-	}
-	return o.publisher.Publish(ctx, events.TopicGatewayCommands, p.ID(), env)
-}
-
-func (o *PaymentOrchestrator) emitCheckPaymentStatus(ctx context.Context, p *payment.Payment, causationID string) error {
-	env, err := events.NewEnvelope(
-		events.CommandCheckPaymentStatus,
-		events.AggregateTypeGateway,
-		p.ID(),
-		0,
-		events.CheckPaymentStatusCommand{
-			PaymentID: p.ID(),
-			Provider:  p.Provider(),
-		},
-		events.Metadata{CorrelationID: p.ID(), CausationID: causationID},
-		o.clock,
-		o.idGen,
-	)
-	if err != nil {
-		return err
-	}
-	return o.publisher.Publish(ctx, events.TopicGatewayCommands, p.ID(), env)
-}
-
-func (o *PaymentOrchestrator) emitRefundPayment(ctx context.Context, p *payment.Payment, refundID string, amount events.Money) error {
-	env, err := events.NewEnvelope(
-		events.CommandRefundPayment,
-		events.AggregateTypeGateway,
-		p.ID(),
-		0,
-		events.RefundPaymentCommand{
-			PaymentID:   p.ID(),
-			RefundID:    refundID,
-			Provider:    p.Provider(),
-			ProviderRef: p.ProviderRef(),
-			Amount:      amount,
-		},
-		events.Metadata{CorrelationID: p.ID()},
-		o.clock,
-		o.idGen,
-	)
-	if err != nil {
-		return err
-	}
-	return o.publisher.Publish(ctx, events.TopicGatewayCommands, p.ID(), env)
+	return o.publisher.Publish(ctx, topic, partitionKey, env)
 }
 
 func (o *PaymentOrchestrator) registerWaiter(paymentID string) chan reserveOutcome {
@@ -860,11 +974,11 @@ func (o *PaymentOrchestrator) unregisterWaiter(paymentID string) {
 
 func (o *PaymentOrchestrator) notifyWaiter(paymentID string, outcome reserveOutcome) {
 	o.waitMu.Lock()
-	ch, ok := o.waiters[paymentID]
+	waitCh, exists := o.waiters[paymentID]
 	o.waitMu.Unlock()
-	if ok {
+	if exists {
 		select {
-		case ch <- outcome:
+		case waitCh <- outcome:
 		default:
 		}
 	}

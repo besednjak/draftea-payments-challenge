@@ -14,33 +14,19 @@ import (
 
 	"github.com/besednjak/draftea-payments-challenge/internal/application/ports"
 	"github.com/besednjak/draftea-payments-challenge/internal/domain/events"
+	"github.com/besednjak/draftea-payments-challenge/internal/observability"
 )
 
-var (
-	// ErrBusClosed is returned when publishing to a closed EventBus.
-	ErrBusClosed = errors.New("event bus is closed")
-)
+var ErrBusClosed = errors.New("event bus is closed")
 
-type nonRetryableError struct {
-	err error
-}
-
-func (e nonRetryableError) Error() string { return e.err.Error() }
-func (e nonRetryableError) Unwrap() error { return e.err }
-
-// NonRetryable wraps an error (such as a corrupt payload / poison pill) so the bus
-// routes the message straight to the DLQ without burning retry attempts.
+// NonRetryable marks an error as permanent so the bus routes it directly to the DLQ.
 func NonRetryable(err error) error {
-	if err == nil {
-		return nil
-	}
-	return nonRetryableError{err: err}
+	return ports.NonRetryable(err)
 }
 
 // IsNonRetryable reports whether err is marked as a permanent/poison-pill error.
 func IsNonRetryable(err error) bool {
-	var target nonRetryableError
-	return errors.As(err, &target)
+	return ports.IsNonRetryable(err)
 }
 
 // Config tunes the in-memory partitioned EventBus.
@@ -94,9 +80,9 @@ type partitionQueue struct {
 }
 
 func newPartitionQueue() *partitionQueue {
-	q := &partitionQueue{}
-	q.cond = sync.NewCond(&q.mu)
-	return q
+	queue := &partitionQueue{}
+	queue.cond = sync.NewCond(&queue.mu)
+	return queue
 }
 
 func (q *partitionQueue) push(msg busMessage) bool {
@@ -120,7 +106,7 @@ func (q *partitionQueue) pop() (busMessage, bool) {
 		return busMessage{}, false
 	}
 	msg := q.items[0]
-	q.items[0] = busMessage{} // release references for GC
+	q.items[0] = busMessage{}
 	q.items = q.items[1:]
 	return msg, true
 }
@@ -146,9 +132,11 @@ type PartitionedBus struct {
 	dlqMu sync.RWMutex
 	dlqs  map[string][]ports.DeadLetter
 
-	inFlightMu   sync.Mutex
-	inFlightCond *sync.Cond
-	inFlight     int64
+	// idleCh is closed whenever inFlight reaches 0 and replaced when inFlight becomes > 0,
+	// allowing Drain(ctx) to wait without spawning goroutines that leak on timeout.
+	inFlightMu sync.Mutex
+	inFlight   int64
+	idleCh     chan struct{}
 
 	closed    atomic.Bool
 	closeOnce sync.Once
@@ -161,23 +149,26 @@ func NewPartitionedBus(cfg Config) *PartitionedBus {
 	cfg = cfg.withDefaults()
 	runCtx, cancelRun := context.WithCancel(context.Background())
 
-	b := &PartitionedBus{
+	initialIdle := make(chan struct{})
+	close(initialIdle)
+
+	bus := &PartitionedBus{
 		cfg:        cfg,
 		partitions: make([]*partitionQueue, cfg.Partitions),
 		subs:       make(map[string][]subscription),
 		dlqs:       make(map[string][]ports.DeadLetter),
+		idleCh:     initialIdle,
 		runCtx:     runCtx,
 		cancelRun:  cancelRun,
 	}
-	b.inFlightCond = sync.NewCond(&b.inFlightMu)
 
-	for i := 0; i < cfg.Partitions; i++ {
-		q := newPartitionQueue()
-		b.partitions[i] = q
-		b.workersWG.Add(1)
-		go b.runPartition(i, q)
+	for index := 0; index < cfg.Partitions; index++ {
+		queue := newPartitionQueue()
+		bus.partitions[index] = queue
+		bus.workersWG.Add(1)
+		go bus.runPartition(queue)
 	}
-	return b
+	return bus
 }
 
 // Subscribe registers a consumer-group handler for topic.
@@ -187,12 +178,11 @@ func (b *PartitionedBus) Subscribe(topic, consumerGroup string, handler ports.Ev
 	}
 
 	b.subMu.Lock()
-	defer b.subMu.Unlock()
-
 	b.subs[topic] = append(b.subs[topic], subscription{
 		group:   consumerGroup,
 		handler: handler,
 	})
+	b.subMu.Unlock()
 	return nil
 }
 
@@ -205,11 +195,11 @@ func (b *PartitionedBus) Publish(ctx context.Context, topic, partitionKey string
 		return ErrBusClosed
 	}
 
-	idx := b.partitionFor(partitionKey)
+	partitionIndex := b.partitionFor(partitionKey)
 	msgCtx := context.WithoutCancel(ctx)
 
 	b.addInFlight(1)
-	if !b.partitions[idx].push(busMessage{
+	if !b.partitions[partitionIndex].push(busMessage{
 		ctx:          msgCtx,
 		topic:        topic,
 		partitionKey: partitionKey,
@@ -221,34 +211,32 @@ func (b *PartitionedBus) Publish(ctx context.Context, topic, partitionKey string
 	return nil
 }
 
-// Drain blocks until all currently enqueued and cascaded messages finish processing
-// or ctx expires. Ideal for deterministic integration tests and CLI demos.
+// Drain blocks until all enqueued and cascaded messages finish processing or ctx expires.
 func (b *PartitionedBus) Drain(ctx context.Context) error {
-	done := make(chan struct{})
-	go func() {
+	for {
 		b.inFlightMu.Lock()
-		for b.inFlight > 0 {
-			b.inFlightCond.Wait()
+		if b.inFlight == 0 {
+			b.inFlightMu.Unlock()
+			return nil
 		}
+		waitCh := b.idleCh
 		b.inFlightMu.Unlock()
-		close(done)
-	}()
 
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+		select {
+		case <-waitCh:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }
 
 // Close stops accepting new publications and waits for in-flight messages to drain
-// until ctx expires.
+// until ctx expires, cancelling any active retry backoffs immediately on timeout.
 func (b *PartitionedBus) Close(ctx context.Context) error {
 	b.closeOnce.Do(func() {
 		b.closed.Store(true)
-		for _, q := range b.partitions {
-			q.close()
+		for _, queue := range b.partitions {
+			queue.close()
 		}
 	})
 
@@ -264,11 +252,12 @@ func (b *PartitionedBus) Close(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		b.cancelRun()
+		<-done
 		return ctx.Err()
 	}
 }
 
-// DeadLetters returns a copy of dead-lettered messages for a topic (accepts either
+// DeadLetters returns a copy of dead-lettered messages for topic (accepts either
 // the source topic name or its ".dlq" name).
 func (b *PartitionedBus) DeadLetters(topic string) []ports.DeadLetter {
 	dlqName := topic
@@ -279,10 +268,10 @@ func (b *PartitionedBus) DeadLetters(topic string) []ports.DeadLetter {
 	b.dlqMu.RLock()
 	defer b.dlqMu.RUnlock()
 
-	src := b.dlqs[dlqName]
-	out := make([]ports.DeadLetter, len(src))
-	copy(out, src)
-	return out
+	stored := b.dlqs[dlqName]
+	copied := make([]ports.DeadLetter, len(stored))
+	copy(copied, stored)
+	return copied
 }
 
 // Name implements ports.HealthChecker.
@@ -300,26 +289,31 @@ func (b *PartitionedBus) Check(ctx context.Context) error {
 }
 
 func (b *PartitionedBus) partitionFor(key string) int {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(key))
-	return int(h.Sum32()) % len(b.partitions)
+	hasher := fnv.New32a()
+	_, _ = hasher.Write([]byte(key))
+	return int(hasher.Sum32()) % len(b.partitions)
 }
 
 func (b *PartitionedBus) addInFlight(delta int64) {
 	b.inFlightMu.Lock()
+	previous := b.inFlight
 	b.inFlight += delta
-	if b.inFlight <= 0 {
+	if previous == 0 && b.inFlight > 0 {
+		b.idleCh = make(chan struct{})
+	} else if b.inFlight <= 0 {
 		b.inFlight = 0
-		b.inFlightCond.Broadcast()
+		if previous > 0 {
+			close(b.idleCh)
+		}
 	}
 	b.inFlightMu.Unlock()
 }
 
-func (b *PartitionedBus) runPartition(_ int, q *partitionQueue) {
+func (b *PartitionedBus) runPartition(queue *partitionQueue) {
 	defer b.workersWG.Done()
 
 	for {
-		msg, ok := q.pop()
+		msg, ok := queue.pop()
 		if !ok {
 			return
 		}
@@ -330,11 +324,11 @@ func (b *PartitionedBus) runPartition(_ int, q *partitionQueue) {
 
 func (b *PartitionedBus) dispatch(msg busMessage) {
 	b.subMu.RLock()
-	subs := make([]subscription, len(b.subs[msg.topic]))
-	copy(subs, b.subs[msg.topic])
+	subscribers := make([]subscription, len(b.subs[msg.topic]))
+	copy(subscribers, b.subs[msg.topic])
 	b.subMu.RUnlock()
 
-	for _, sub := range subs {
+	for _, sub := range subscribers {
 		b.deliverWithRetry(msg, sub)
 	}
 }
@@ -347,6 +341,7 @@ func (b *PartitionedBus) deliverWithRetry(msg busMessage, sub subscription) {
 	)
 
 	delay := b.cfg.RetryBaseDelay
+retryLoop:
 	for attempt := 1; attempt <= b.cfg.MaxAttempts; attempt++ {
 		attempts = attempt
 		err := sub.handler(msg.ctx, msg.envelope)
@@ -359,8 +354,8 @@ func (b *PartitionedBus) deliverWithRetry(msg busMessage, sub subscription) {
 			firstFailedAt = time.Now().UTC()
 		}
 
-		if IsNonRetryable(err) {
-			break
+		if ports.IsNonRetryable(err) {
+			break retryLoop
 		}
 
 		if attempt < b.cfg.MaxAttempts {
@@ -368,7 +363,7 @@ func (b *PartitionedBus) deliverWithRetry(msg busMessage, sub subscription) {
 			select {
 			case <-b.runCtx.Done():
 				timer.Stop()
-				break
+				return
 			case <-timer.C:
 			}
 			delay *= 2
@@ -407,14 +402,14 @@ func (b *PartitionedBus) sendToDLQ(
 		b.cfg.Metrics.RecordDLQMessage(msg.topic)
 	}
 
-	b.cfg.Logger.Error("message routed to DLQ",
+	logCtx := observability.WithCorrelation(msg.ctx, msg.envelope.CorrelationID, "", "")
+	observability.LoggerFromContext(logCtx, b.cfg.Logger).Error("message routed to DLQ",
 		"dlq_topic", dlqName,
 		"original_topic", msg.topic,
 		"consumer_group", group,
 		"partition_key", msg.partitionKey,
 		"event_id", msg.envelope.EventID,
 		"event_type", msg.envelope.Type,
-		"correlation_id", msg.envelope.CorrelationID,
 		"attempts", attempts,
 		"error", err.Error(),
 	)

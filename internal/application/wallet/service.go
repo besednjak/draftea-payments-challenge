@@ -13,9 +13,10 @@ import (
 	"github.com/besednjak/draftea-payments-challenge/internal/application/ports"
 	"github.com/besednjak/draftea-payments-challenge/internal/domain/events"
 	domainwallet "github.com/besednjak/draftea-payments-challenge/internal/domain/wallet"
+	"github.com/besednjak/draftea-payments-challenge/internal/observability"
 )
 
-const consumerName = "wallet-service"
+const walletConsumerName = "wallet-service"
 
 // Config wires dependencies and resilience settings for the Wallet application service.
 type Config struct {
@@ -97,7 +98,8 @@ func NewService(cfg Config) *Service {
 // CreateWallet initializes a new wallet stream, updates the balance read model,
 // and publishes WalletCreated.
 func (s *Service) CreateWallet(ctx context.Context, walletID, userID, currency string) (*domainwallet.Wallet, error) {
-	w, err := domainwallet.Create(
+	ctx = observability.WithCorrelation(ctx, walletID, "", walletID)
+	createdWallet, err := domainwallet.Create(
 		walletID,
 		userID,
 		currency,
@@ -109,23 +111,24 @@ func (s *Service) CreateWallet(ctx context.Context, walletID, userID, currency s
 		return nil, err
 	}
 
-	uncommitted := w.UncommittedEvents()
-	if err := s.store.Append(ctx, w.StreamID(), 0, uncommitted...); err != nil {
+	uncommitted := createdWallet.UncommittedEvents()
+	if err := s.store.Append(ctx, createdWallet.StreamID(), 0, uncommitted...); err != nil {
 		return nil, err
 	}
-	w.ClearUncommitted()
+	createdWallet.ClearUncommitted()
 
-	if err := s.syncBalanceView(ctx, w); err != nil {
+	if err := s.syncBalanceView(ctx, createdWallet); err != nil {
 		return nil, err
 	}
-	if err := s.publishEvents(ctx, w.ID(), uncommitted); err != nil {
+	if err := s.publishEvents(ctx, createdWallet.ID(), uncommitted); err != nil {
 		return nil, err
 	}
-	return w, nil
+	return createdWallet, nil
 }
 
 // Deposit credits funds to walletID with optimistic locking retry.
 func (s *Service) Deposit(ctx context.Context, walletID, referenceID string, amount events.Money) (*domainwallet.Wallet, error) {
+	ctx = observability.WithCorrelation(ctx, referenceID, "", walletID)
 	meta := events.Metadata{CorrelationID: referenceID}
 	return s.executeWithRetry(ctx, walletID, func(w *domainwallet.Wallet) error {
 		return w.Deposit(referenceID, amount, meta)
@@ -135,18 +138,18 @@ func (s *Service) Deposit(ctx context.Context, walletID, referenceID string, amo
 // GetBalance queries the synchronous read-your-writes wallet balance view.
 func (s *Service) GetBalance(ctx context.Context, walletID string) (ports.WalletBalanceView, error) {
 	if s.balances == nil {
-		w, err := s.Load(ctx, walletID)
+		loaded, err := s.Load(ctx, walletID)
 		if err != nil {
 			return ports.WalletBalanceView{}, err
 		}
 		return ports.WalletBalanceView{
-			WalletID:  w.ID(),
-			UserID:    w.UserID(),
-			Currency:  w.Currency(),
-			Balance:   w.Balance(),
-			Held:      w.Held(),
-			Available: w.Available(),
-			Version:   w.Version(),
+			WalletID:  loaded.ID(),
+			UserID:    loaded.UserID(),
+			Currency:  loaded.Currency(),
+			Balance:   loaded.Balance(),
+			Held:      loaded.Held(),
+			Available: loaded.Available(),
+			Version:   loaded.Version(),
 			UpdatedAt: s.clock().UTC(),
 		}, nil
 	}
@@ -158,28 +161,28 @@ func (s *Service) Load(ctx context.Context, walletID string) (*domainwallet.Wall
 	streamID := events.StreamID(events.AggregateTypeWallet, walletID)
 
 	var (
-		domSnap     *domainwallet.Snapshot
+		domainSnap  *domainwallet.Snapshot
 		fromVersion int64
 	)
 
 	if s.snapshots != nil {
-		snap, ok, err := s.snapshots.LoadSnapshot(ctx, streamID)
+		snap, found, err := s.snapshots.LoadSnapshot(ctx, streamID)
 		if err != nil {
 			return nil, fmt.Errorf("load wallet snapshot %s: %w", streamID, err)
 		}
-		if ok {
+		if found {
 			var decoded domainwallet.Snapshot
 			if err := json.Unmarshal(snap.State, &decoded); err != nil {
 				return nil, fmt.Errorf("decode wallet snapshot %s: %w", streamID, err)
 			}
-			domSnap = &decoded
+			domainSnap = &decoded
 			fromVersion = snap.Version
 		}
 	}
 
 	history, err := s.store.LoadStream(ctx, streamID, fromVersion)
 	if err != nil {
-		if domSnap != nil && errors.Is(err, ports.ErrStreamNotFound) {
+		if domainSnap != nil && errors.Is(err, ports.ErrStreamNotFound) {
 			history = nil
 		} else {
 			return nil, err
@@ -187,7 +190,7 @@ func (s *Service) Load(ctx context.Context, walletID string) (*domainwallet.Wall
 	}
 
 	return domainwallet.Rehydrate(
-		domSnap,
+		domainSnap,
 		history,
 		domainwallet.WithClock(s.clock),
 		domainwallet.WithIDGenerator(s.idGen),
@@ -195,23 +198,29 @@ func (s *Service) Load(ctx context.Context, walletID string) (*domainwallet.Wall
 }
 
 // HandleCommand consumes commands from wallets.commands.v1.
-func (s *Service) HandleCommand(ctx context.Context, env events.Envelope) error {
+func (s *Service) HandleCommand(ctx context.Context, env events.Envelope) (retErr error) {
 	if s.inbox != nil && env.EventID != "" {
-		dup, err := s.inbox.TryMarkProcessed(ctx, consumerName, env.EventID)
+		alreadyProcessed, err := s.inbox.TryMarkProcessed(ctx, walletConsumerName, env.EventID)
 		if err != nil {
 			return err
 		}
-		if dup {
+		if alreadyProcessed {
 			return nil
 		}
+		defer func() {
+			if retErr != nil {
+				_ = s.inbox.UnmarkProcessed(ctx, walletConsumerName, env.EventID)
+			}
+		}()
 	}
 
 	switch env.Type {
 	case events.CommandReserveFunds:
 		cmd, err := events.DecodePayload[events.ReserveFundsCommand](env)
 		if err != nil {
-			return err
+			return ports.NonRetryable(err)
 		}
+		ctx = observability.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, cmd.WalletID)
 		meta := events.Metadata{CorrelationID: cmd.PaymentID, CausationID: env.EventID}
 		_, err = s.executeWithRetry(ctx, cmd.WalletID, func(w *domainwallet.Wallet) error {
 			return w.Reserve(cmd.PaymentID, cmd.Amount, meta)
@@ -221,8 +230,9 @@ func (s *Service) HandleCommand(ctx context.Context, env events.Envelope) error 
 	case events.CommandCaptureFunds:
 		cmd, err := events.DecodePayload[events.CaptureFundsCommand](env)
 		if err != nil {
-			return err
+			return ports.NonRetryable(err)
 		}
+		ctx = observability.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, cmd.WalletID)
 		meta := events.Metadata{CorrelationID: cmd.PaymentID, CausationID: env.EventID}
 		_, err = s.executeWithRetry(ctx, cmd.WalletID, func(w *domainwallet.Wallet) error {
 			return w.Capture(cmd.PaymentID, cmd.Amount, meta)
@@ -232,8 +242,9 @@ func (s *Service) HandleCommand(ctx context.Context, env events.Envelope) error 
 	case events.CommandReleaseFunds:
 		cmd, err := events.DecodePayload[events.ReleaseFundsCommand](env)
 		if err != nil {
-			return err
+			return ports.NonRetryable(err)
 		}
+		ctx = observability.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, cmd.WalletID)
 		meta := events.Metadata{CorrelationID: cmd.PaymentID, CausationID: env.EventID}
 		_, err = s.executeWithRetry(ctx, cmd.WalletID, func(w *domainwallet.Wallet) error {
 			return w.Release(cmd.PaymentID, cmd.Reason, meta)
@@ -243,8 +254,9 @@ func (s *Service) HandleCommand(ctx context.Context, env events.Envelope) error 
 	case events.CommandRefundFunds:
 		cmd, err := events.DecodePayload[events.RefundFundsCommand](env)
 		if err != nil {
-			return err
+			return ports.NonRetryable(err)
 		}
+		ctx = observability.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, cmd.WalletID)
 		meta := events.Metadata{CorrelationID: cmd.PaymentID, CausationID: env.EventID}
 		_, err = s.executeWithRetry(ctx, cmd.WalletID, func(w *domainwallet.Wallet) error {
 			return w.Refund(cmd.PaymentID, cmd.RefundID, cmd.Amount, meta)
@@ -264,32 +276,32 @@ func (s *Service) executeWithRetry(
 	var lastErr error
 
 	for attempt := 0; attempt < s.maxLockRetries; attempt++ {
-		w, err := s.Load(ctx, walletID)
+		loaded, err := s.Load(ctx, walletID)
 		if err != nil {
 			return nil, err
 		}
-		baseVersion := w.Version()
+		previousVersion := loaded.Version()
 
-		if err := mutate(w); err != nil {
+		if err := mutate(loaded); err != nil {
 			return nil, err
 		}
 
-		uncommitted := w.UncommittedEvents()
+		uncommitted := loaded.UncommittedEvents()
 		if len(uncommitted) == 0 {
-			return w, nil // Idempotent no-op.
+			return loaded, nil
 		}
 
-		err = s.store.Append(ctx, w.StreamID(), w.BaseVersion(), uncommitted...)
+		err = s.store.Append(ctx, loaded.StreamID(), loaded.BaseVersion(), uncommitted...)
 		if err == nil {
-			w.ClearUncommitted()
-			if err := s.syncBalanceView(ctx, w); err != nil {
+			loaded.ClearUncommitted()
+			if err := s.syncBalanceView(ctx, loaded); err != nil {
 				return nil, err
 			}
-			s.maybeSaveSnapshot(ctx, w, baseVersion)
-			if err := s.publishEvents(ctx, w.ID(), uncommitted); err != nil {
+			s.maybeSaveSnapshot(ctx, loaded, previousVersion)
+			if err := s.publishEvents(ctx, loaded.ID(), uncommitted); err != nil {
 				return nil, err
 			}
-			return w, nil
+			return loaded, nil
 		}
 
 		if !errors.Is(err, ports.ErrVersionConflict) {
@@ -300,8 +312,7 @@ func (s *Service) executeWithRetry(
 		if s.metrics != nil {
 			s.metrics.RecordOptimisticLockRetry(events.AggregateTypeWallet)
 		}
-		s.logger.Warn("wallet optimistic lock conflict, reloading aggregate",
-			"wallet_id", walletID,
+		observability.LoggerFromContext(ctx, s.logger).Warn("wallet optimistic lock conflict, reloading aggregate",
 			"attempt", attempt+1,
 			"max_retries", s.maxLockRetries,
 		)
@@ -340,25 +351,25 @@ func (s *Service) syncBalanceView(ctx context.Context, w *domainwallet.Wallet) e
 	})
 }
 
-func (s *Service) maybeSaveSnapshot(ctx context.Context, w *domainwallet.Wallet, prevVersion int64) {
+func (s *Service) maybeSaveSnapshot(ctx context.Context, w *domainwallet.Wallet, previousVersion int64) {
 	if s.snapshots == nil || s.snapshotInterval <= 0 {
 		return
 	}
-	if w.Version()/s.snapshotInterval <= prevVersion/s.snapshotInterval {
+	if w.Version()/s.snapshotInterval <= previousVersion/s.snapshotInterval {
 		return
 	}
-	raw, err := json.Marshal(w.TakeSnapshot())
+	encoded, err := json.Marshal(w.TakeSnapshot())
 	if err != nil {
-		s.logger.Error("marshal wallet snapshot failed", "wallet_id", w.ID(), "error", err.Error())
+		observability.LoggerFromContext(ctx, s.logger).Error("marshal wallet snapshot failed", "error", err.Error())
 		return
 	}
 	if err := s.snapshots.SaveSnapshot(ctx, ports.Snapshot{
 		StreamID:  w.StreamID(),
 		Version:   w.Version(),
-		State:     raw,
+		State:     encoded,
 		CreatedAt: s.clock().UTC(),
 	}); err != nil {
-		s.logger.Error("save wallet snapshot failed", "wallet_id", w.ID(), "error", err.Error())
+		observability.LoggerFromContext(ctx, s.logger).Error("save wallet snapshot failed", "error", err.Error())
 	}
 }
 

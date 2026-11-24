@@ -9,20 +9,14 @@ import (
 	"time"
 )
 
-const (
-	// DefaultSchemaVersion is the initial schema version for all envelopes.
-	DefaultSchemaVersion = 1
-)
+const DefaultSchemaVersion = 1
 
-var (
-	// ErrInvalidEnvelope is returned when required envelope fields are missing.
-	ErrInvalidEnvelope = errors.New("invalid event envelope")
-)
+var ErrInvalidEnvelope = errors.New("invalid event envelope")
 
-// Clock returns the current time. Injectable in tests for deterministic timestamps.
+// Clock returns the current time and is injectable for deterministic tests.
 type Clock func() time.Time
 
-// IDGenerator produces unique identifiers. Injectable in tests for deterministic IDs.
+// IDGenerator produces unique identifiers and is injectable for deterministic tests.
 type IDGenerator func() string
 
 // DefaultClock returns the current UTC time.
@@ -30,24 +24,25 @@ func DefaultClock() time.Time {
 	return time.Now().UTC()
 }
 
-// NewUUID generates a random RFC 4122 version 4 UUID using crypto/rand (stdlib only).
+// NewUUID generates a random RFC 4122 version 4 UUID using crypto/rand.
 func NewUUID() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	b[6] = (b[6] & 0x0f) | 0x40 // version 4
-	b[8] = (b[8] & 0x3f) | 0x80 // variant RFC 4122
+	var raw [16]byte
+	_, _ = rand.Read(raw[:])
+	// Set version (4) and RFC 4122 variant bits.
+	raw[6] = (raw[6] & 0x0f) | 0x40
+	raw[8] = (raw[8] & 0x3f) | 0x80
 
-	var out [36]byte
-	hex.Encode(out[0:8], b[0:4])
-	out[8] = '-'
-	hex.Encode(out[9:13], b[4:6])
-	out[13] = '-'
-	hex.Encode(out[14:18], b[6:8])
-	out[18] = '-'
-	hex.Encode(out[19:23], b[8:10])
-	out[23] = '-'
-	hex.Encode(out[24:36], b[10:16])
-	return string(out[:])
+	var formatted [36]byte
+	hex.Encode(formatted[0:8], raw[0:4])
+	formatted[8] = '-'
+	hex.Encode(formatted[9:13], raw[4:6])
+	formatted[13] = '-'
+	hex.Encode(formatted[14:18], raw[6:8])
+	formatted[18] = '-'
+	hex.Encode(formatted[19:23], raw[8:10])
+	formatted[23] = '-'
+	hex.Encode(formatted[24:36], raw[10:16])
+	return string(formatted[:])
 }
 
 // Envelope is the canonical message wrapper shared by all domain events and commands.
@@ -64,7 +59,7 @@ type Envelope struct {
 	Payload          json.RawMessage `json:"payload"`
 }
 
-// Metadata carries tracing and optional deterministic overrides when creating envelopes.
+// Metadata carries tracing identifiers and optional deterministic overrides.
 type Metadata struct {
 	CorrelationID string
 	CausationID   string
@@ -90,7 +85,7 @@ func NewEnvelope(
 		return Envelope{}, fmt.Errorf("%w: aggregateVersion must be >= 0", ErrInvalidEnvelope)
 	}
 
-	raw, err := json.Marshal(payload)
+	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return Envelope{}, fmt.Errorf("marshal payload for %s: %w", eventType, err)
 	}
@@ -125,20 +120,20 @@ func NewEnvelope(
 		OccurredAt:       occurredAt,
 		CorrelationID:    meta.CorrelationID,
 		CausationID:      meta.CausationID,
-		Payload:          raw,
+		Payload:          encoded,
 	}, nil
 }
 
 // DecodePayload unmarshals the JSON payload of an Envelope into type T.
 func DecodePayload[T any](env Envelope) (T, error) {
-	var out T
+	var decoded T
 	if len(env.Payload) == 0 {
-		return out, fmt.Errorf("%w: empty payload for %s", ErrInvalidEnvelope, env.Type)
+		return decoded, fmt.Errorf("%w: empty payload for %s", ErrInvalidEnvelope, env.Type)
 	}
-	if err := json.Unmarshal(env.Payload, &out); err != nil {
-		return out, fmt.Errorf("decode payload for %s: %w", env.Type, err)
+	if err := json.Unmarshal(env.Payload, &decoded); err != nil {
+		return decoded, fmt.Errorf("decode payload for %s: %w", env.Type, err)
 	}
-	return out, nil
+	return decoded, nil
 }
 
 // StreamID returns the canonical Event Store stream identifier (<aggregate>-<id>).

@@ -44,8 +44,8 @@ type Snapshot struct {
 	Refunds      map[string]int64 `json:"refunds,omitempty"`
 }
 
-// Wallet is the Event-Sourced aggregate that acts as the source of truth for a
-// user's funds in a single currency. Invariant: Available() == Balance - Held >= 0.
+// Wallet is the Event-Sourced aggregate acting as the source of truth for a user's
+// funds in a single currency. Invariant: Available() == Balance - Held >= 0.
 type Wallet struct {
 	id       string
 	userID   string
@@ -92,7 +92,7 @@ func Create(walletID, userID, currency string, meta events.Metadata, opts ...Opt
 	if userID == "" {
 		return nil, ErrInvalidUserID
 	}
-	normCurrency, err := events.NormalizeCurrency(currency)
+	normalizedCurrency, err := events.NormalizeCurrency(currency)
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +101,7 @@ func Create(walletID, userID, currency string, meta events.Metadata, opts ...Opt
 	payload := events.WalletCreatedPayload{
 		WalletID: walletID,
 		UserID:   userID,
-		Currency: normCurrency,
+		Currency: normalizedCurrency,
 	}
 	if err := w.record(events.EventWalletCreated, walletID, payload, meta); err != nil {
 		return nil, err
@@ -110,28 +110,28 @@ func Create(walletID, userID, currency string, meta events.Metadata, opts ...Opt
 }
 
 // Rehydrate rebuilds a Wallet from an optional snapshot plus subsequent events.
-func Rehydrate(snap *Snapshot, history []events.Envelope, opts ...Option) (*Wallet, error) {
+func Rehydrate(snapshot *Snapshot, history []events.Envelope, opts ...Option) (*Wallet, error) {
 	w := newEmpty(opts...)
-	if snap != nil {
-		if snap.WalletID == "" {
+	if snapshot != nil {
+		if snapshot.WalletID == "" {
 			return nil, ErrInvalidWalletID
 		}
-		w.id = snap.WalletID
-		w.userID = snap.UserID
-		w.currency = snap.Currency
-		w.balance = snap.Balance
-		w.held = snap.Held
-		w.version = snap.Version
+		w.id = snapshot.WalletID
+		w.userID = snapshot.UserID
+		w.currency = snapshot.Currency
+		w.balance = snapshot.Balance
+		w.held = snapshot.Held
+		w.version = snapshot.Version
 		w.created = true
-		maps.Copy(w.deposits, snap.Deposits)
-		maps.Copy(w.reservations, snap.Reservations)
-		maps.Copy(w.captured, snap.Captured)
-		maps.Copy(w.released, snap.Released)
-		maps.Copy(w.refunds, snap.Refunds)
+		maps.Copy(w.deposits, snapshot.Deposits)
+		maps.Copy(w.reservations, snapshot.Reservations)
+		maps.Copy(w.captured, snapshot.Captured)
+		maps.Copy(w.released, snapshot.Released)
+		maps.Copy(w.refunds, snapshot.Refunds)
 	}
 
 	for _, env := range history {
-		if snap != nil && env.AggregateVersion <= snap.Version {
+		if snapshot != nil && env.AggregateVersion <= snapshot.Version {
 			continue
 		}
 		if err := w.Apply(env); err != nil {
@@ -145,8 +145,7 @@ func Rehydrate(snap *Snapshot, history []events.Envelope, opts ...Option) (*Wall
 	return w, nil
 }
 
-// Deposit credits funds to the wallet. If referenceID is non-empty and was already
-// applied, the call is an idempotent no-op.
+// Deposit credits funds to the wallet. Non-empty referenceIDs are deduplicated.
 func (w *Wallet) Deposit(referenceID string, amount events.Money, meta events.Metadata) error {
 	if !w.created {
 		return ErrWalletNotCreated
@@ -174,10 +173,8 @@ func (w *Wallet) Deposit(referenceID string, amount events.Money, meta events.Me
 	return w.record(events.EventFundsDeposited, w.id, payload, meta)
 }
 
-// Reserve places a hold for paymentID.
-//   - Idempotent if paymentID was already reserved, captured, or released.
-//   - Emits FundsReservationRejected if currency mismatches or available funds are insufficient.
-//   - Emits FundsReserved otherwise.
+// Reserve places a hold for paymentID. It is idempotent per paymentID and emits
+// FundsReservationRejected when currency mismatches or available funds are insufficient.
 func (w *Wallet) Reserve(paymentID string, amount events.Money, meta events.Metadata) error {
 	if !w.created {
 		return ErrWalletNotCreated
@@ -190,10 +187,10 @@ func (w *Wallet) Reserve(paymentID string, amount events.Money, meta events.Meta
 		return err
 	}
 
-	if _, ok := w.reservations[paymentID]; ok {
+	if _, reserved := w.reservations[paymentID]; reserved {
 		return nil
 	}
-	if _, ok := w.captured[paymentID]; ok {
+	if _, captured := w.captured[paymentID]; captured {
 		return nil
 	}
 	if w.released[paymentID] {
@@ -231,8 +228,7 @@ func (w *Wallet) Reserve(paymentID string, amount events.Money, meta events.Meta
 	return w.record(events.EventFundsReserved, w.id, payload, meta)
 }
 
-// Capture permanently deducts an active reservation for paymentID.
-// Idempotent if paymentID was already captured.
+// Capture permanently deducts an active reservation for paymentID (idempotent).
 func (w *Wallet) Capture(paymentID string, amount events.Money, meta events.Metadata) error {
 	if !w.created {
 		return ErrWalletNotCreated
@@ -244,19 +240,19 @@ func (w *Wallet) Capture(paymentID string, amount events.Money, meta events.Meta
 	if err != nil {
 		return err
 	}
-	if _, ok := w.captured[paymentID]; ok {
+	if _, alreadyCaptured := w.captured[paymentID]; alreadyCaptured {
 		return nil
 	}
 	if money.Currency != w.currency {
 		return fmt.Errorf("%w: wallet=%s capture=%s", ErrCurrencyMismatch, w.currency, money.Currency)
 	}
 
-	reserved, ok := w.reservations[paymentID]
-	if !ok {
+	reservedAmount, exists := w.reservations[paymentID]
+	if !exists {
 		return fmt.Errorf("%w: payment_id=%s", ErrReservationNotFound, paymentID)
 	}
-	if reserved != money.Amount {
-		return fmt.Errorf("%w: reserved=%d requested=%d", ErrCaptureAmountMismatch, reserved, money.Amount)
+	if reservedAmount != money.Amount {
+		return fmt.Errorf("%w: reserved=%d requested=%d", ErrCaptureAmountMismatch, reservedAmount, money.Amount)
 	}
 
 	balanceAfter := w.balance - money.Amount
@@ -271,8 +267,7 @@ func (w *Wallet) Capture(paymentID string, amount events.Money, meta events.Meta
 	return w.record(events.EventFundsCaptured, w.id, payload, meta)
 }
 
-// Release frees an active reservation (compensating action).
-// Idempotent if paymentID was already released.
+// Release frees an active reservation as a compensating action (idempotent).
 func (w *Wallet) Release(paymentID, reason string, meta events.Metadata) error {
 	if !w.created {
 		return ErrWalletNotCreated
@@ -283,19 +278,19 @@ func (w *Wallet) Release(paymentID, reason string, meta events.Metadata) error {
 	if w.released[paymentID] {
 		return nil
 	}
-	if _, ok := w.captured[paymentID]; ok {
+	if _, alreadyCaptured := w.captured[paymentID]; alreadyCaptured {
 		return fmt.Errorf("%w: payment_id=%s", ErrReservationAlreadyCaptured, paymentID)
 	}
 
-	reserved, ok := w.reservations[paymentID]
-	if !ok {
+	reservedAmount, exists := w.reservations[paymentID]
+	if !exists {
 		return fmt.Errorf("%w: payment_id=%s", ErrReservationNotFound, paymentID)
 	}
 
-	heldAfter := w.held - reserved
+	heldAfter := w.held - reservedAmount
 	payload := events.FundsReleasedPayload{
 		PaymentID:      paymentID,
-		Amount:         events.Money{Amount: reserved, Currency: w.currency},
+		Amount:         events.Money{Amount: reservedAmount, Currency: w.currency},
 		Reason:         reason,
 		BalanceAfter:   w.balance,
 		HeldAfter:      heldAfter,
@@ -304,8 +299,7 @@ func (w *Wallet) Release(paymentID, reason string, meta events.Metadata) error {
 	return w.record(events.EventFundsReleased, w.id, payload, meta)
 }
 
-// Refund credits a refund amount back into the wallet balance.
-// Idempotent per refundID.
+// Refund credits a refund amount back into the wallet balance (idempotent per refundID).
 func (w *Wallet) Refund(paymentID, refundID string, amount events.Money, meta events.Metadata) error {
 	if !w.created {
 		return ErrWalletNotCreated
@@ -323,7 +317,7 @@ func (w *Wallet) Refund(paymentID, refundID string, amount events.Money, meta ev
 	if money.Currency != w.currency {
 		return fmt.Errorf("%w: wallet=%s refund=%s", ErrCurrencyMismatch, w.currency, money.Currency)
 	}
-	if _, ok := w.refunds[refundID]; ok {
+	if _, alreadyRefunded := w.refunds[refundID]; alreadyRefunded {
 		return nil
 	}
 
@@ -339,7 +333,7 @@ func (w *Wallet) Refund(paymentID, refundID string, amount events.Money, meta ev
 	return w.record(events.EventFundsRefunded, w.id, payload, meta)
 }
 
-// Apply transitions the aggregate state by applying a persisted or newly recorded event.
+// Apply transitions the aggregate state from a persisted or newly recorded event.
 func (w *Wallet) Apply(env events.Envelope) error {
 	expectedVersion := w.version + 1
 	if env.AggregateVersion != expectedVersion {
@@ -351,67 +345,66 @@ func (w *Wallet) Apply(env events.Envelope) error {
 		if w.created {
 			return ErrWalletAlreadyCreated
 		}
-		p, err := events.DecodePayload[events.WalletCreatedPayload](env)
+		payload, err := events.DecodePayload[events.WalletCreatedPayload](env)
 		if err != nil {
 			return err
 		}
-		w.id = p.WalletID
-		w.userID = p.UserID
-		w.currency = p.Currency
+		w.id = payload.WalletID
+		w.userID = payload.UserID
+		w.currency = payload.Currency
 		w.balance = 0
 		w.held = 0
 		w.created = true
 
 	case events.EventFundsDeposited:
-		p, err := events.DecodePayload[events.FundsDepositedPayload](env)
+		payload, err := events.DecodePayload[events.FundsDepositedPayload](env)
 		if err != nil {
 			return err
 		}
-		w.balance += p.Amount.Amount
-		if p.ReferenceID != "" {
-			w.deposits[p.ReferenceID] = true
+		w.balance += payload.Amount.Amount
+		if payload.ReferenceID != "" {
+			w.deposits[payload.ReferenceID] = true
 		}
 
 	case events.EventFundsReserved:
-		p, err := events.DecodePayload[events.FundsReservedPayload](env)
+		payload, err := events.DecodePayload[events.FundsReservedPayload](env)
 		if err != nil {
 			return err
 		}
-		w.held += p.Amount.Amount
-		w.reservations[p.PaymentID] = p.Amount.Amount
+		w.held += payload.Amount.Amount
+		w.reservations[payload.PaymentID] = payload.Amount.Amount
 
 	case events.EventFundsReservationRejected:
 		if _, err := events.DecodePayload[events.FundsReservationRejectedPayload](env); err != nil {
 			return err
 		}
-		// Balance and held remain unchanged.
 
 	case events.EventFundsCaptured:
-		p, err := events.DecodePayload[events.FundsCapturedPayload](env)
+		payload, err := events.DecodePayload[events.FundsCapturedPayload](env)
 		if err != nil {
 			return err
 		}
-		w.balance -= p.Amount.Amount
-		w.held -= p.Amount.Amount
-		delete(w.reservations, p.PaymentID)
-		w.captured[p.PaymentID] = p.Amount.Amount
+		w.balance -= payload.Amount.Amount
+		w.held -= payload.Amount.Amount
+		delete(w.reservations, payload.PaymentID)
+		w.captured[payload.PaymentID] = payload.Amount.Amount
 
 	case events.EventFundsReleased:
-		p, err := events.DecodePayload[events.FundsReleasedPayload](env)
+		payload, err := events.DecodePayload[events.FundsReleasedPayload](env)
 		if err != nil {
 			return err
 		}
-		w.held -= p.Amount.Amount
-		delete(w.reservations, p.PaymentID)
-		w.released[p.PaymentID] = true
+		w.held -= payload.Amount.Amount
+		delete(w.reservations, payload.PaymentID)
+		w.released[payload.PaymentID] = true
 
 	case events.EventFundsRefunded:
-		p, err := events.DecodePayload[events.FundsRefundedPayload](env)
+		payload, err := events.DecodePayload[events.FundsRefundedPayload](env)
 		if err != nil {
 			return err
 		}
-		w.balance += p.Amount.Amount
-		w.refunds[p.RefundID] = p.Amount.Amount
+		w.balance += payload.Amount.Amount
+		w.refunds[payload.RefundID] = payload.Amount.Amount
 
 	default:
 		return fmt.Errorf("%w: %s", ErrUnknownEventType, env.Type)
@@ -442,9 +435,9 @@ func (w *Wallet) record(eventType, aggregateID string, payload any, meta events.
 	return nil
 }
 
-// TakeSnapshot returns a deep copy of the current aggregate state for snapshot persistence.
+// TakeSnapshot returns a deep copy of the current state for snapshot persistence.
 func (w *Wallet) TakeSnapshot() Snapshot {
-	snap := Snapshot{
+	snapshot := Snapshot{
 		WalletID:     w.id,
 		UserID:       w.userID,
 		Currency:     w.currency,
@@ -457,42 +450,40 @@ func (w *Wallet) TakeSnapshot() Snapshot {
 		Released:     make(map[string]bool, len(w.released)),
 		Refunds:      make(map[string]int64, len(w.refunds)),
 	}
-	maps.Copy(snap.Deposits, w.deposits)
-	maps.Copy(snap.Reservations, w.reservations)
-	maps.Copy(snap.Captured, w.captured)
-	maps.Copy(snap.Released, w.released)
-	maps.Copy(snap.Refunds, w.refunds)
-	return snap
+	maps.Copy(snapshot.Deposits, w.deposits)
+	maps.Copy(snapshot.Reservations, w.reservations)
+	maps.Copy(snapshot.Captured, w.captured)
+	maps.Copy(snapshot.Released, w.released)
+	maps.Copy(snapshot.Refunds, w.refunds)
+	return snapshot
 }
 
-// --- Accessors ---
+func (w *Wallet) ID() string       { return w.id }
+func (w *Wallet) UserID() string   { return w.userID }
+func (w *Wallet) Currency() string { return w.currency }
+func (w *Wallet) Balance() int64   { return w.balance }
+func (w *Wallet) Held() int64      { return w.held }
+func (w *Wallet) Available() int64 { return w.balance - w.held }
+func (w *Wallet) Version() int64   { return w.version }
+func (w *Wallet) StreamID() string { return events.StreamID(events.AggregateTypeWallet, w.id) }
 
-func (w *Wallet) ID() string        { return w.id }
-func (w *Wallet) UserID() string    { return w.userID }
-func (w *Wallet) Currency() string  { return w.currency }
-func (w *Wallet) Balance() int64    { return w.balance }
-func (w *Wallet) Held() int64       { return w.held }
-func (w *Wallet) Available() int64  { return w.balance - w.held }
-func (w *Wallet) Version() int64    { return w.version }
-func (w *Wallet) StreamID() string  { return events.StreamID(events.AggregateTypeWallet, w.id) }
-
-// BaseVersion returns the aggregate version prior to any uncommitted events.
-// Pass this value as expectedVersion to EventStore.Append for optimistic locking.
+// BaseVersion returns the aggregate version prior to any uncommitted events,
+// to be passed as expectedVersion to EventStore.Append for optimistic locking.
 func (w *Wallet) BaseVersion() int64 {
 	return w.version - int64(len(w.uncommitted))
 }
 
 // HasReservation reports whether paymentID currently has an active hold.
 func (w *Wallet) HasReservation(paymentID string) (int64, bool) {
-	amt, ok := w.reservations[paymentID]
-	return amt, ok
+	amount, exists := w.reservations[paymentID]
+	return amount, exists
 }
 
-// UncommittedEvents returns a copy of the events recorded since the last ClearUncommitted.
+// UncommittedEvents returns a copy of events recorded since the last ClearUncommitted.
 func (w *Wallet) UncommittedEvents() []events.Envelope {
-	out := make([]events.Envelope, len(w.uncommitted))
-	copy(out, w.uncommitted)
-	return out
+	copied := make([]events.Envelope, len(w.uncommitted))
+	copy(copied, w.uncommitted)
+	return copied
 }
 
 // ClearUncommitted empties the pending event buffer after persistence.

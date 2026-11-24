@@ -1,6 +1,5 @@
 package events
 
-// Topic names following <domain>.<events|commands>.v<N>.
 const (
 	TopicPaymentsEvents  = "payments.events.v1"
 	TopicWalletsCommands = "wallets.commands.v1"
@@ -9,19 +8,17 @@ const (
 	TopicGatewayEvents   = "gateway.events.v1"
 )
 
-// DLQTopic returns the dead-letter queue topic name for a given source topic.
+// DLQTopic returns the dead-letter queue topic name for a source topic.
 func DLQTopic(topic string) string {
 	return topic + ".dlq"
 }
 
-// Aggregate type identifiers used in stream names and envelopes.
 const (
 	AggregateTypeWallet  = "wallet"
 	AggregateTypePayment = "payment"
 	AggregateTypeGateway = "gateway"
 )
 
-// Standard domain rejection/failure reason codes.
 const (
 	ReasonInsufficientFunds = "INSUFFICIENT_FUNDS"
 	ReasonCurrencyMismatch  = "CURRENCY_MISMATCH"
@@ -31,7 +28,6 @@ const (
 	ReasonReconcileExpired  = "RECONCILIATION_WINDOW_EXPIRED"
 )
 
-// Command types.
 const (
 	CommandReserveFunds       = "wallet.ReserveFunds"
 	CommandCaptureFunds       = "wallet.CaptureFunds"
@@ -42,7 +38,6 @@ const (
 	CommandRefundPayment      = "gateway.RefundPayment"
 )
 
-// Wallet domain event types.
 const (
 	EventWalletCreated            = "wallet.WalletCreated"
 	EventFundsDeposited           = "wallet.FundsDeposited"
@@ -53,7 +48,6 @@ const (
 	EventFundsRefunded            = "wallet.FundsRefunded"
 )
 
-// Payment domain event types.
 const (
 	EventPaymentInitiated            = "payment.PaymentInitiated"
 	EventPaymentFundsReserved        = "payment.PaymentFundsReserved"
@@ -66,7 +60,6 @@ const (
 	EventPaymentRefunded             = "payment.PaymentRefunded"
 )
 
-// Gateway adapter event types.
 const (
 	EventGatewaySubmissionAccepted = "gateway.GatewaySubmissionAccepted"
 	EventGatewaySubmissionNotSent  = "gateway.GatewaySubmissionNotSent"
@@ -77,8 +70,6 @@ const (
 	EventGatewayRefundApproved     = "gateway.GatewayRefundApproved"
 	EventGatewayRefundDeclined     = "gateway.GatewayRefundDeclined"
 )
-
-// --- Command payloads ---
 
 type ReserveFundsCommand struct {
 	PaymentID string `json:"payment_id"`
@@ -124,8 +115,6 @@ type RefundPaymentCommand struct {
 	ProviderRef string `json:"provider_ref"`
 	Amount      Money  `json:"amount"`
 }
-
-// --- Wallet event payloads ---
 
 type WalletCreatedPayload struct {
 	WalletID string `json:"wallet_id"`
@@ -182,8 +171,6 @@ type FundsRefundedPayload struct {
 	HeldAfter      int64  `json:"held_after"`
 	AvailableAfter int64  `json:"available_after"`
 }
-
-// --- Payment event payloads ---
 
 type PaymentInitiatedPayload struct {
 	PaymentID string `json:"payment_id"`
@@ -242,8 +229,6 @@ type PaymentRefundedPayload struct {
 	RefundedTotal int64  `json:"refunded_total"`
 	FullyRefunded bool   `json:"fully_refunded"`
 }
-
-// --- Gateway event payloads ---
 
 type GatewaySubmissionAcceptedPayload struct {
 	PaymentID   string `json:"payment_id"`

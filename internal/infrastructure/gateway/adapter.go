@@ -12,15 +12,18 @@ import (
 
 	"github.com/besednjak/draftea-payments-challenge/internal/application/ports"
 	"github.com/besednjak/draftea-payments-challenge/internal/domain/events"
+	"github.com/besednjak/draftea-payments-challenge/internal/observability"
 )
 
-// WebhookPayload represents a normalized provider callback body authenticated with HMAC.
+const gatewayConsumerName = "gateway-adapter"
+
+// WebhookPayload represents a normalized provider callback authenticated with HMAC.
 type WebhookPayload struct {
 	ProviderEventID string `json:"provider_event_id"`
 	PaymentID       string `json:"payment_id"`
 	Provider        string `json:"provider"`
 	ProviderRef     string `json:"provider_ref,omitempty"`
-	Status          string `json:"status"` // "APPROVED" or "DECLINED"
+	Status          string `json:"status"`
 	Reason          string `json:"reason,omitempty"`
 }
 
@@ -43,7 +46,7 @@ type AdapterConfig struct {
 // bulkhead, circuit breaker, and exponential backoff + jitter, and emits normalized
 // events on gateway.events.v1.
 type Adapter struct {
-	gw            ports.PaymentGateway
+	gatewayClient ports.PaymentGateway
 	publisher     ports.EventPublisher
 	inbox         ports.InboxStore
 	breaker       *CircuitBreaker
@@ -83,7 +86,7 @@ func NewAdapter(cfg AdapterConfig) *Adapter {
 	}
 
 	return &Adapter{
-		gw:            cfg.Gateway,
+		gatewayClient: cfg.Gateway,
 		publisher:     cfg.Publisher,
 		inbox:         cfg.Inbox,
 		breaker:       breaker,
@@ -99,16 +102,23 @@ func NewAdapter(cfg AdapterConfig) *Adapter {
 }
 
 // HandleCommand consumes commands from gateway.commands.v1.
-func (a *Adapter) HandleCommand(ctx context.Context, env events.Envelope) error {
-	if a.inbox != nil {
-		dup, err := a.inbox.TryMarkProcessed(ctx, "gateway-adapter", env.EventID)
+func (a *Adapter) HandleCommand(ctx context.Context, env events.Envelope) (retErr error) {
+	if a.inbox != nil && env.EventID != "" {
+		alreadyProcessed, err := a.inbox.TryMarkProcessed(ctx, gatewayConsumerName, env.EventID)
 		if err != nil {
 			return err
 		}
-		if dup {
+		if alreadyProcessed {
 			return nil
 		}
+		defer func() {
+			if retErr != nil {
+				_ = a.inbox.UnmarkProcessed(ctx, gatewayConsumerName, env.EventID)
+			}
+		}()
 	}
+
+	ctx = observability.WithCorrelation(ctx, env.CorrelationID, env.AggregateID, "")
 
 	switch env.Type {
 	case events.CommandSubmitPayment:
@@ -123,68 +133,79 @@ func (a *Adapter) HandleCommand(ctx context.Context, env events.Envelope) error 
 }
 
 // HandleWebhook validates HMAC signature, deduplicates by provider_event_id, and
-// publishes the normalized gateway outcome event.
+// publishes the normalized gateway outcome event. If publishing fails, the webhook
+// deduplication mark is reverted so the provider's retry is processed cleanly.
 func (a *Adapter) HandleWebhook(ctx context.Context, signature string, body []byte) error {
 	if a.webhookSecret != "" && !VerifyWebhook(a.webhookSecret, body, signature) {
 		return ErrInvalidWebhookSignature
 	}
 
-	var wh WebhookPayload
-	if err := json.Unmarshal(body, &wh); err != nil {
+	var webhook WebhookPayload
+	if err := json.Unmarshal(body, &webhook); err != nil {
 		return fmt.Errorf("unmarshal webhook payload: %w", err)
 	}
-	if wh.ProviderEventID == "" || wh.PaymentID == "" {
+	if webhook.ProviderEventID == "" || webhook.PaymentID == "" {
 		return fmt.Errorf("provider_event_id and payment_id are required")
 	}
 
 	a.webhookMu.Lock()
-	if _, dup := a.seenWebhooks[wh.ProviderEventID]; dup {
+	if _, duplicate := a.seenWebhooks[webhook.ProviderEventID]; duplicate {
 		a.webhookMu.Unlock()
 		return nil
 	}
-	a.seenWebhooks[wh.ProviderEventID] = struct{}{}
+	a.seenWebhooks[webhook.ProviderEventID] = struct{}{}
 	a.webhookMu.Unlock()
 
+	ctx = observability.WithCorrelation(ctx, webhook.PaymentID, webhook.PaymentID, "")
 	meta := events.Metadata{
-		CorrelationID: wh.PaymentID,
-		CausationID:   wh.ProviderEventID,
+		CorrelationID: webhook.PaymentID,
+		CausationID:   webhook.ProviderEventID,
 	}
 
-	switch wh.Status {
+	var emitErr error
+	switch webhook.Status {
 	case string(ports.GatewayOutcomeApproved):
-		return a.emit(ctx, events.EventGatewayPaymentApproved, wh.PaymentID, events.GatewayPaymentApprovedPayload{
-			PaymentID:   wh.PaymentID,
-			Provider:    wh.Provider,
-			ProviderRef: wh.ProviderRef,
+		emitErr = a.emit(ctx, events.EventGatewayPaymentApproved, webhook.PaymentID, events.GatewayPaymentApprovedPayload{
+			PaymentID:   webhook.PaymentID,
+			Provider:    webhook.Provider,
+			ProviderRef: webhook.ProviderRef,
 		}, meta)
 
 	case string(ports.GatewayOutcomeDeclined):
-		reason := wh.Reason
+		reason := webhook.Reason
 		if reason == "" {
 			reason = events.ReasonGatewayDeclined
 		}
-		return a.emit(ctx, events.EventGatewayPaymentDeclined, wh.PaymentID, events.GatewayPaymentDeclinedPayload{
-			PaymentID: wh.PaymentID,
-			Provider:  wh.Provider,
+		emitErr = a.emit(ctx, events.EventGatewayPaymentDeclined, webhook.PaymentID, events.GatewayPaymentDeclinedPayload{
+			PaymentID: webhook.PaymentID,
+			Provider:  webhook.Provider,
 			Reason:    reason,
 		}, meta)
 
 	default:
-		return fmt.Errorf("unsupported webhook status: %s", wh.Status)
+		emitErr = fmt.Errorf("unsupported webhook status: %s", webhook.Status)
 	}
+
+	if emitErr != nil {
+		a.webhookMu.Lock()
+		delete(a.seenWebhooks, webhook.ProviderEventID)
+		a.webhookMu.Unlock()
+	}
+	return emitErr
 }
 
 func (a *Adapter) handleSubmitPayment(ctx context.Context, env events.Envelope) error {
 	cmd, err := events.DecodePayload[events.SubmitPaymentCommand](env)
 	if err != nil {
-		return err
+		return ports.NonRetryable(err)
 	}
+	ctx = observability.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, "")
 	meta := events.Metadata{
 		CorrelationID: cmd.PaymentID,
 		CausationID:   env.EventID,
 	}
 
-	// Non-blocking bulkhead acquisition: if saturated, we know the request was NOT sent.
+	// Non-blocking bulkhead acquisition: if saturated, the request was never sent.
 	select {
 	case a.bulkhead <- struct{}{}:
 		defer func() { <-a.bulkhead }()
@@ -202,14 +223,14 @@ func (a *Adapter) handleSubmitPayment(ctx context.Context, env events.Envelope) 
 	for attempt := 0; attempt < a.retry.MaxAttempts; attempt++ {
 		if err := a.breaker.Allow(); err != nil {
 			if !sentAnyAttempt {
-				// Certainty of non-delivery: safe for saga to release funds.
+				// Certainty of non-delivery: safe for the saga to release held funds.
 				return a.emit(ctx, events.EventGatewaySubmissionNotSent, cmd.PaymentID, events.GatewaySubmissionNotSentPayload{
 					PaymentID: cmd.PaymentID,
 					Provider:  cmd.Provider,
 					Reason:    events.ReasonCircuitOpen,
 				}, meta)
 			}
-			// A prior attempt already went over the wire: outcome is uncertain!
+			// A prior attempt already went over the wire: never emit NotSent because the provider may have processed it.
 			return a.emit(ctx, events.EventGatewayOutcomeUnknown, cmd.PaymentID, events.GatewayOutcomeUnknownPayload{
 				PaymentID: cmd.PaymentID,
 				Provider:  cmd.Provider,
@@ -220,7 +241,7 @@ func (a *Adapter) handleSubmitPayment(ctx context.Context, env events.Envelope) 
 		sentAnyAttempt = true
 		start := a.clock()
 		attemptCtx, cancel := context.WithTimeout(ctx, a.retry.AttemptTimeout)
-		res, callErr := a.gw.SubmitPayment(attemptCtx, ports.GatewaySubmitRequest{
+		result, callErr := a.gatewayClient.SubmitPayment(attemptCtx, ports.GatewaySubmitRequest{
 			PaymentID: cmd.PaymentID,
 			Provider:  cmd.Provider,
 			ServiceID: cmd.ServiceID,
@@ -231,8 +252,8 @@ func (a *Adapter) handleSubmitPayment(ctx context.Context, env events.Envelope) 
 
 		if callErr == nil {
 			a.breaker.RecordSuccess()
-			a.recordAttempt(cmd.Provider, string(res.Outcome), elapsed)
-			return a.emitSubmitOutcome(ctx, cmd, res, meta)
+			a.recordAttempt(cmd.Provider, string(result.Outcome), elapsed)
+			return a.emitSubmitOutcome(ctx, cmd, result, meta)
 		}
 
 		lastErr = callErr
@@ -240,8 +261,7 @@ func (a *Adapter) handleSubmitPayment(ctx context.Context, env events.Envelope) 
 		a.breaker.RecordFailure(isTimeout)
 		a.recordAttempt(cmd.Provider, "ERROR", elapsed)
 
-		a.logger.Warn("gateway submit attempt failed",
-			"correlation_id", cmd.PaymentID,
+		observability.LoggerFromContext(ctx, a.logger).Warn("gateway submit attempt failed",
 			"provider", cmd.Provider,
 			"attempt", attempt+1,
 			"max_attempts", a.retry.MaxAttempts,
@@ -270,26 +290,26 @@ func (a *Adapter) handleSubmitPayment(ctx context.Context, env events.Envelope) 
 func (a *Adapter) emitSubmitOutcome(
 	ctx context.Context,
 	cmd events.SubmitPaymentCommand,
-	res ports.GatewaySubmitResult,
+	result ports.GatewaySubmitResult,
 	meta events.Metadata,
 ) error {
-	switch res.Outcome {
+	switch result.Outcome {
 	case ports.GatewayOutcomeAccepted:
 		return a.emit(ctx, events.EventGatewaySubmissionAccepted, cmd.PaymentID, events.GatewaySubmissionAcceptedPayload{
 			PaymentID:   cmd.PaymentID,
 			Provider:    cmd.Provider,
-			ProviderRef: res.ProviderRef,
+			ProviderRef: result.ProviderRef,
 		}, meta)
 
 	case ports.GatewayOutcomeApproved:
 		return a.emit(ctx, events.EventGatewayPaymentApproved, cmd.PaymentID, events.GatewayPaymentApprovedPayload{
 			PaymentID:   cmd.PaymentID,
 			Provider:    cmd.Provider,
-			ProviderRef: res.ProviderRef,
+			ProviderRef: result.ProviderRef,
 		}, meta)
 
 	case ports.GatewayOutcomeDeclined:
-		reason := res.Reason
+		reason := result.Reason
 		if reason == "" {
 			reason = events.ReasonGatewayDeclined
 		}
@@ -303,7 +323,7 @@ func (a *Adapter) emitSubmitOutcome(
 		return a.emit(ctx, events.EventGatewayOutcomeUnknown, cmd.PaymentID, events.GatewayOutcomeUnknownPayload{
 			PaymentID: cmd.PaymentID,
 			Provider:  cmd.Provider,
-			Reason:    fmt.Sprintf("unexpected gateway outcome: %s", res.Outcome),
+			Reason:    fmt.Sprintf("unexpected gateway outcome: %s", result.Outcome),
 		}, meta)
 	}
 }
@@ -311,15 +331,16 @@ func (a *Adapter) emitSubmitOutcome(
 func (a *Adapter) handleCheckStatus(ctx context.Context, env events.Envelope) error {
 	cmd, err := events.DecodePayload[events.CheckPaymentStatusCommand](env)
 	if err != nil {
-		return err
+		return ports.NonRetryable(err)
 	}
+	ctx = observability.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, "")
 	meta := events.Metadata{
 		CorrelationID: cmd.PaymentID,
 		CausationID:   env.EventID,
 	}
 
 	attemptCtx, cancel := context.WithTimeout(ctx, a.retry.AttemptTimeout)
-	res, err := a.gw.CheckStatus(attemptCtx, cmd.PaymentID, cmd.Provider)
+	result, err := a.gatewayClient.CheckStatus(attemptCtx, cmd.PaymentID, cmd.Provider)
 	cancel()
 
 	if err != nil {
@@ -329,18 +350,18 @@ func (a *Adapter) handleCheckStatus(ctx context.Context, env events.Envelope) er
 		}, meta)
 	}
 
-	switch res.Outcome {
+	switch result.Outcome {
 	case ports.GatewayOutcomeApproved:
 		return a.emit(ctx, events.EventGatewayPaymentApproved, cmd.PaymentID, events.GatewayPaymentApprovedPayload{
 			PaymentID:   cmd.PaymentID,
 			Provider:    cmd.Provider,
-			ProviderRef: res.ProviderRef,
+			ProviderRef: result.ProviderRef,
 		}, meta)
 
 	case ports.GatewayOutcomeDeclined, ports.GatewayOutcomeNotFound:
-		reason := res.Reason
+		reason := result.Reason
 		if reason == "" {
-			reason = string(res.Outcome)
+			reason = string(result.Outcome)
 		}
 		return a.emit(ctx, events.EventGatewayPaymentDeclined, cmd.PaymentID, events.GatewayPaymentDeclinedPayload{
 			PaymentID: cmd.PaymentID,
@@ -359,15 +380,16 @@ func (a *Adapter) handleCheckStatus(ctx context.Context, env events.Envelope) er
 func (a *Adapter) handleRefundPayment(ctx context.Context, env events.Envelope) error {
 	cmd, err := events.DecodePayload[events.RefundPaymentCommand](env)
 	if err != nil {
-		return err
+		return ports.NonRetryable(err)
 	}
+	ctx = observability.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, "")
 	meta := events.Metadata{
 		CorrelationID: cmd.PaymentID,
 		CausationID:   env.EventID,
 	}
 
 	attemptCtx, cancel := context.WithTimeout(ctx, a.retry.AttemptTimeout)
-	res, err := a.gw.RefundPayment(attemptCtx, ports.GatewayRefundRequest{
+	result, err := a.gatewayClient.RefundPayment(attemptCtx, ports.GatewayRefundRequest{
 		PaymentID:   cmd.PaymentID,
 		RefundID:    cmd.RefundID,
 		Provider:    cmd.Provider,
@@ -376,8 +398,8 @@ func (a *Adapter) handleRefundPayment(ctx context.Context, env events.Envelope) 
 	})
 	cancel()
 
-	if err != nil || !res.Approved {
-		reason := res.Reason
+	if err != nil || !result.Approved {
+		reason := result.Reason
 		if err != nil {
 			reason = err.Error()
 		}
@@ -393,7 +415,7 @@ func (a *Adapter) handleRefundPayment(ctx context.Context, env events.Envelope) 
 		PaymentID:   cmd.PaymentID,
 		RefundID:    cmd.RefundID,
 		Provider:    cmd.Provider,
-		ProviderRef: res.ProviderRef,
+		ProviderRef: result.ProviderRef,
 		Amount:      cmd.Amount,
 	}, meta)
 }

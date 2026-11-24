@@ -127,8 +127,8 @@ func (m *MockGateway) StatusCalls(paymentID string) int {
 }
 
 func (m *MockGateway) ruleForLocked(paymentID string) MockBehavior {
-	if r, ok := m.rules[paymentID]; ok {
-		return r
+	if rule, exists := m.rules[paymentID]; exists {
+		return rule
 	}
 	return m.defaultRule
 }

@@ -54,14 +54,14 @@ func (r *HealthRegistry) Readiness(ctx context.Context) (bool, []ports.HealthSta
 	results := make([]ports.HealthStatus, 0, len(checkers))
 	now := r.clock().UTC()
 
-	for _, c := range checkers {
+	for _, checker := range checkers {
 		status := ports.HealthStatus{
-			Name:      c.Name(),
+			Name:      checker.Name(),
 			Healthy:   true,
 			Message:   "ok",
 			CheckedAt: now,
 		}
-		if err := c.Check(ctx); err != nil {
+		if err := checker.Check(ctx); err != nil {
 			status.Healthy = false
 			status.Message = err.Error()
 			allHealthy = false

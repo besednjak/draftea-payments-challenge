@@ -2,6 +2,7 @@ package payment
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/besednjak/draftea-payments-challenge/internal/domain/events"
 )
@@ -51,7 +52,7 @@ var allowedTransitions = map[Status]map[Status]bool{
 	},
 }
 
-// CanTransitionTo reports whether transitioning from s to next is valid in the state machine.
+// CanTransitionTo reports whether transitioning from s to next is valid.
 func (s Status) CanTransitionTo(next Status) bool {
 	targets, ok := allowedTransitions[s]
 	if !ok {
@@ -65,8 +66,8 @@ func (s Status) IsTerminal() bool {
 	return s == StatusRejected || s == StatusFailed || s == StatusRefunded
 }
 
-// IsActiveSaga reports whether the payment is still in an in-flight saga state
-// that should be resumed automatically after a process restart.
+// IsActiveSaga reports whether the payment is in an in-flight state that should
+// be resumed automatically after a process restart.
 func (s Status) IsActiveSaga() bool {
 	switch s {
 	case StatusPending, StatusFundsReserved, StatusSubmitted, StatusGatewayUnknown:
@@ -122,6 +123,7 @@ type Payment struct {
 	capturedAmount int64
 	refundedTotal  int64
 	refunds        map[string]int64
+	createdAt      time.Time
 	version        int64
 	initiated      bool
 
@@ -263,7 +265,7 @@ func (p *Payment) MarkManualReview(reason string, meta events.Metadata) error {
 	return p.record(events.EventPaymentManualReviewRequired, p.id, payload, meta)
 }
 
-// MarkCompleted transitions FUNDS_RESERVED, SUBMITTED, GATEWAY_UNKNOWN, or MANUAL_REVIEW -> COMPLETED.
+// MarkCompleted transitions an active or manual-review payment to COMPLETED.
 func (p *Payment) MarkCompleted(providerRef string, meta events.Metadata) error {
 	if err := p.ensureTransition(StatusCompleted); err != nil {
 		return err
@@ -281,7 +283,7 @@ func (p *Payment) MarkCompleted(providerRef string, meta events.Metadata) error 
 	return p.record(events.EventPaymentCompleted, p.id, payload, meta)
 }
 
-// MarkFailed transitions FUNDS_RESERVED, SUBMITTED, GATEWAY_UNKNOWN, or MANUAL_REVIEW -> FAILED.
+// MarkFailed transitions an active or manual-review payment to FAILED.
 func (p *Payment) MarkFailed(reason string, meta events.Metadata) error {
 	if err := p.ensureTransition(StatusFailed); err != nil {
 		return err
@@ -294,7 +296,7 @@ func (p *Payment) MarkFailed(reason string, meta events.Metadata) error {
 }
 
 // RecordRefund applies a partial or full refund on a COMPLETED payment.
-// Idempotent per refundID. Enforces refundedTotal + amount <= capturedAmount.
+// It is idempotent per refundID and enforces refundedTotal + amount <= capturedAmount.
 func (p *Payment) RecordRefund(refundID string, amount events.Money, meta events.Metadata) error {
 	if !p.initiated {
 		return ErrPaymentNotInitiated
@@ -343,17 +345,18 @@ func (p *Payment) Apply(env events.Envelope) error {
 		if p.initiated {
 			return ErrPaymentAlreadyInitiated
 		}
-		d, err := events.DecodePayload[events.PaymentInitiatedPayload](env)
+		payload, err := events.DecodePayload[events.PaymentInitiatedPayload](env)
 		if err != nil {
 			return err
 		}
-		p.id = d.PaymentID
-		p.walletID = d.WalletID
-		p.userID = d.UserID
-		p.serviceID = d.ServiceID
-		p.provider = d.Provider
-		p.amount = d.Amount
+		p.id = payload.PaymentID
+		p.walletID = payload.WalletID
+		p.userID = payload.UserID
+		p.serviceID = payload.ServiceID
+		p.provider = payload.Provider
+		p.amount = payload.Amount
 		p.status = StatusPending
+		p.createdAt = env.OccurredAt
 		p.initiated = true
 
 	case events.EventPaymentFundsReserved:
@@ -363,67 +366,67 @@ func (p *Payment) Apply(env events.Envelope) error {
 		p.status = StatusFundsReserved
 
 	case events.EventPaymentRejected:
-		d, err := events.DecodePayload[events.PaymentRejectedPayload](env)
+		payload, err := events.DecodePayload[events.PaymentRejectedPayload](env)
 		if err != nil {
 			return err
 		}
 		p.status = StatusRejected
-		p.failureReason = d.Reason
+		p.failureReason = payload.Reason
 
 	case events.EventPaymentSubmitted:
-		d, err := events.DecodePayload[events.PaymentSubmittedPayload](env)
+		payload, err := events.DecodePayload[events.PaymentSubmittedPayload](env)
 		if err != nil {
 			return err
 		}
 		p.status = StatusSubmitted
-		if d.ProviderRef != "" {
-			p.providerRef = d.ProviderRef
+		if payload.ProviderRef != "" {
+			p.providerRef = payload.ProviderRef
 		}
 
 	case events.EventPaymentGatewayUnknown:
-		d, err := events.DecodePayload[events.PaymentGatewayUnknownPayload](env)
+		payload, err := events.DecodePayload[events.PaymentGatewayUnknownPayload](env)
 		if err != nil {
 			return err
 		}
 		p.status = StatusGatewayUnknown
-		p.failureReason = d.Reason
+		p.failureReason = payload.Reason
 
 	case events.EventPaymentManualReviewRequired:
-		d, err := events.DecodePayload[events.PaymentManualReviewRequiredPayload](env)
+		payload, err := events.DecodePayload[events.PaymentManualReviewRequiredPayload](env)
 		if err != nil {
 			return err
 		}
 		p.status = StatusManualReview
-		p.failureReason = d.Reason
+		p.failureReason = payload.Reason
 
 	case events.EventPaymentCompleted:
-		d, err := events.DecodePayload[events.PaymentCompletedPayload](env)
+		payload, err := events.DecodePayload[events.PaymentCompletedPayload](env)
 		if err != nil {
 			return err
 		}
 		p.status = StatusCompleted
-		p.capturedAmount = d.CapturedAmount
-		if d.ProviderRef != "" {
-			p.providerRef = d.ProviderRef
+		p.capturedAmount = payload.CapturedAmount
+		if payload.ProviderRef != "" {
+			p.providerRef = payload.ProviderRef
 		}
 		p.failureReason = ""
 
 	case events.EventPaymentFailed:
-		d, err := events.DecodePayload[events.PaymentFailedPayload](env)
+		payload, err := events.DecodePayload[events.PaymentFailedPayload](env)
 		if err != nil {
 			return err
 		}
 		p.status = StatusFailed
-		p.failureReason = d.Reason
+		p.failureReason = payload.Reason
 
 	case events.EventPaymentRefunded:
-		d, err := events.DecodePayload[events.PaymentRefundedPayload](env)
+		payload, err := events.DecodePayload[events.PaymentRefundedPayload](env)
 		if err != nil {
 			return err
 		}
-		p.refundedTotal = d.RefundedTotal
-		p.refunds[d.RefundID] = d.Amount.Amount
-		if d.FullyRefunded {
+		p.refundedTotal = payload.RefundedTotal
+		p.refunds[payload.RefundID] = payload.Amount.Amount
+		if payload.FullyRefunded {
 			p.status = StatusRefunded
 		}
 
@@ -469,8 +472,6 @@ func (p *Payment) record(eventType, aggregateID string, payload any, meta events
 	return nil
 }
 
-// --- Accessors ---
-
 func (p *Payment) ID() string              { return p.id }
 func (p *Payment) WalletID() string        { return p.walletID }
 func (p *Payment) UserID() string          { return p.userID }
@@ -483,6 +484,7 @@ func (p *Payment) FailureReason() string   { return p.failureReason }
 func (p *Payment) CapturedAmount() int64   { return p.capturedAmount }
 func (p *Payment) RefundedTotal() int64    { return p.refundedTotal }
 func (p *Payment) RefundableAmount() int64 { return p.capturedAmount - p.refundedTotal }
+func (p *Payment) CreatedAt() time.Time    { return p.createdAt }
 func (p *Payment) Version() int64          { return p.version }
 func (p *Payment) StreamID() string        { return events.StreamID(events.AggregateTypePayment, p.id) }
 
@@ -491,11 +493,11 @@ func (p *Payment) BaseVersion() int64 {
 	return p.version - int64(len(p.uncommitted))
 }
 
-// UncommittedEvents returns a copy of the events recorded since the last ClearUncommitted.
+// UncommittedEvents returns a copy of events recorded since the last ClearUncommitted.
 func (p *Payment) UncommittedEvents() []events.Envelope {
-	out := make([]events.Envelope, len(p.uncommitted))
-	copy(out, p.uncommitted)
-	return out
+	copied := make([]events.Envelope, len(p.uncommitted))
+	copy(copied, p.uncommitted)
+	return copied
 }
 
 // ClearUncommitted empties the pending event buffer after persistence.

@@ -22,41 +22,41 @@ import (
 	"github.com/besednjak/draftea-payments-challenge/internal/observability"
 )
 
-type platform struct {
-	store         *eventstore.InMemoryEventStore
-	snapshots     *eventstore.InMemorySnapshotStore
-	inbox         *eventstore.InMemoryInboxStore
-	idemp         *eventstore.InMemoryIdempotencyStore
-	bus           *eventbus.PartitionedBus
-	balances      *readmodel.WalletBalanceStore
-	txs           *readmodel.WalletTransactionStore
-	payViews      *readmodel.PaymentViewStore
-	projector     *readmodel.Projector
-	mockGW        *gateway.MockGateway
-	breaker       *gateway.CircuitBreaker
-	gwAdapter     *gateway.Adapter
-	walletSvc     *appwallet.Service
-	orchestrator  *saga.PaymentOrchestrator
-	metrics       *observability.Collector
-	health        *observability.HealthRegistry
-	webhookSecret string
+type demoPlatform struct {
+	store            *eventstore.InMemoryEventStore
+	snapshotStore    *eventstore.InMemorySnapshotStore
+	inbox            *eventstore.InMemoryInboxStore
+	idempotencyStore *eventstore.InMemoryIdempotencyStore
+	bus              *eventbus.PartitionedBus
+	balanceStore     *readmodel.WalletBalanceStore
+	transactionStore *readmodel.WalletTransactionStore
+	paymentStore     *readmodel.PaymentViewStore
+	projector        *readmodel.Projector
+	mockGateway      *gateway.MockGateway
+	breaker          *gateway.CircuitBreaker
+	gatewayAdapter   *gateway.Adapter
+	walletService    *appwallet.Service
+	orchestrator     *saga.PaymentOrchestrator
+	metrics          *observability.Collector
+	health           *observability.HealthRegistry
+	webhookSecret    string
 }
 
-func newPlatform(
+func newDemoPlatform(
 	store *eventstore.InMemoryEventStore,
-	snapshots *eventstore.InMemorySnapshotStore,
+	snapshotStore *eventstore.InMemorySnapshotStore,
 	logger *slog.Logger,
-) *platform {
+) *demoPlatform {
 	if store == nil {
 		store = eventstore.NewInMemoryEventStore()
 	}
-	if snapshots == nil {
-		snapshots = eventstore.NewInMemorySnapshotStore()
+	if snapshotStore == nil {
+		snapshotStore = eventstore.NewInMemorySnapshotStore()
 	}
 
 	metrics := observability.NewCollector()
 	inbox := eventstore.NewInMemoryInboxStore()
-	idemp := eventstore.NewInMemoryIdempotencyStore(nil)
+	idempotencyStore := eventstore.NewInMemoryIdempotencyStore(nil)
 	bus := eventbus.NewPartitionedBus(eventbus.Config{
 		Partitions:     8,
 		MaxAttempts:    3,
@@ -66,12 +66,12 @@ func newPlatform(
 		Metrics:        metrics,
 	})
 
-	balances := readmodel.NewWalletBalanceStore()
-	txs := readmodel.NewWalletTransactionStore()
-	payViews := readmodel.NewPaymentViewStore()
-	projector := readmodel.NewProjector(balances, txs, payViews)
+	balanceStore := readmodel.NewWalletBalanceStore()
+	transactionStore := readmodel.NewWalletTransactionStore()
+	paymentStore := readmodel.NewPaymentViewStore()
+	projector := readmodel.NewProjector(balanceStore, transactionStore, paymentStore)
 
-	mockGW := gateway.NewMockGateway(gateway.MockBehavior{
+	mockGateway := gateway.NewMockGateway(gateway.MockBehavior{
 		SubmitOutcome: ports.GatewayOutcomeApproved,
 	})
 	breaker := gateway.NewCircuitBreaker(gateway.CircuitBreakerConfig{
@@ -87,8 +87,8 @@ func newPlatform(
 	metrics.RecordCircuitBreakerState("mockpay", string(breaker.State()))
 
 	webhookSecret := "demo-hmac-secret"
-	gwAdapter := gateway.NewAdapter(gateway.AdapterConfig{
-		Gateway:       mockGW,
+	gatewayAdapter := gateway.NewAdapter(gateway.AdapterConfig{
+		Gateway:       mockGateway,
 		Publisher:     bus,
 		Inbox:         inbox,
 		Breaker:       breaker,
@@ -103,11 +103,11 @@ func newPlatform(
 		},
 	})
 
-	walletSvc := appwallet.NewService(appwallet.Config{
+	walletService := appwallet.NewService(appwallet.Config{
 		EventStore:       store,
-		SnapshotStore:    snapshots,
+		SnapshotStore:    snapshotStore,
 		SnapshotInterval: 5,
-		BalanceReadModel: balances,
+		BalanceReadModel: balanceStore,
 		Publisher:        bus,
 		Inbox:            inbox,
 		Metrics:          metrics,
@@ -116,67 +116,70 @@ func newPlatform(
 
 	orchestrator := saga.NewPaymentOrchestrator(saga.Config{
 		EventStore:      store,
-		PaymentViews:    payViews,
+		PaymentViews:    paymentStore,
 		Publisher:       bus,
 		Inbox:           inbox,
-		Idempotency:     idemp,
+		Idempotency:     idempotencyStore,
 		Metrics:         metrics,
 		Logger:          logger,
 		SyncReserveWait: 2 * time.Second,
 	})
 
-	// Event-driven wiring (4 modular monolith services communicating only through topics).
-	mustSub(bus.Subscribe(events.TopicWalletsCommands, "wallet-service", walletSvc.HandleCommand))
-	mustSub(bus.Subscribe(events.TopicGatewayCommands, "gateway-adapter", gwAdapter.HandleCommand))
-	mustSub(bus.Subscribe(events.TopicWalletsEvents, "payment-saga", orchestrator.HandleWalletEvent))
-	mustSub(bus.Subscribe(events.TopicGatewayEvents, "payment-saga", orchestrator.HandleGatewayEvent))
-	mustSub(bus.Subscribe(events.TopicWalletsEvents, "readmodel-projector", projector.HandleEvent))
-	mustSub(bus.Subscribe(events.TopicPaymentsEvents, "readmodel-projector", projector.HandleEvent))
-	mustSub(bus.Subscribe(events.TopicPaymentsEvents, "metrics-service", metrics.HandleEvent))
-	mustSub(bus.Subscribe(events.TopicWalletsEvents, "metrics-service", metrics.HandleEvent))
-	mustSub(bus.Subscribe(events.TopicGatewayEvents, "metrics-service", metrics.HandleEvent))
+	must(bus.Subscribe(events.TopicWalletsCommands, "wallet-service", walletService.HandleCommand))
+	must(bus.Subscribe(events.TopicGatewayCommands, "gateway-adapter", gatewayAdapter.HandleCommand))
+	must(bus.Subscribe(events.TopicWalletsEvents, "payment-saga", orchestrator.HandleWalletEvent))
+	must(bus.Subscribe(events.TopicGatewayEvents, "payment-saga", orchestrator.HandleGatewayEvent))
+	must(bus.Subscribe(events.TopicWalletsEvents, "readmodel-projector", projector.HandleEvent))
+	must(bus.Subscribe(events.TopicPaymentsEvents, "readmodel-projector", projector.HandleEvent))
+	must(bus.Subscribe(events.TopicPaymentsEvents, "metrics-service", metrics.HandleEvent))
+	must(bus.Subscribe(events.TopicWalletsEvents, "metrics-service", metrics.HandleEvent))
+	must(bus.Subscribe(events.TopicGatewayEvents, "metrics-service", metrics.HandleEvent))
 
 	health := observability.NewHealthRegistry(nil)
 	health.Register(store)
 	health.Register(bus)
-	health.Register(mockGW)
+	health.Register(mockGateway)
 
-	return &platform{
-		store:         store,
-		snapshots:     snapshots,
-		inbox:         inbox,
-		idemp:         idemp,
-		bus:           bus,
-		balances:      balances,
-		txs:           txs,
-		payViews:      payViews,
-		projector:     projector,
-		mockGW:        mockGW,
-		breaker:       breaker,
-		gwAdapter:     gwAdapter,
-		walletSvc:     walletSvc,
-		orchestrator:  orchestrator,
-		metrics:       metrics,
-		health:        health,
-		webhookSecret: webhookSecret,
+	return &demoPlatform{
+		store:            store,
+		snapshotStore:    snapshotStore,
+		inbox:            inbox,
+		idempotencyStore: idempotencyStore,
+		bus:              bus,
+		balanceStore:     balanceStore,
+		transactionStore: transactionStore,
+		paymentStore:     paymentStore,
+		projector:        projector,
+		mockGateway:      mockGateway,
+		breaker:          breaker,
+		gatewayAdapter:   gatewayAdapter,
+		walletService:    walletService,
+		orchestrator:     orchestrator,
+		metrics:          metrics,
+		health:           health,
+		webhookSecret:    webhookSecret,
 	}
 }
 
-func (p *platform) drain(ctx context.Context) {
-	dCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+func (p *demoPlatform) drain(ctx context.Context) {
+	drainCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	if err := p.bus.Drain(dCtx); err != nil {
-		panic(fmt.Sprintf("bus drain failed: %v", err))
-	}
+	must(p.bus.Drain(drainCtx))
 }
 
-func mustSub(err error) {
+func must(err error) {
 	if err != nil {
-		panic(err)
+		fmt.Fprintf(os.Stderr, "demo error: %v\n", err)
+		os.Exit(1)
 	}
 }
 
-func fmtCents(amount int64, currency string) string {
+func mustValue[T any](value T, err error) T {
+	must(err)
+	return value
+}
+
+func formatCents(amount int64, currency string) string {
 	sign := ""
 	if amount < 0 {
 		sign = "-"
@@ -185,32 +188,14 @@ func fmtCents(amount int64, currency string) string {
 	return fmt.Sprintf("%s$%d.%02d %s", sign, amount/100, amount%100, currency)
 }
 
-func main() {
-	ctx := context.Background()
-
-	// Set DEMO_LOGS=1 to emit structured JSON slog output alongside the summary.
-	var logOut io.Writer = io.Discard
-	if os.Getenv("DEMO_LOGS") == "1" {
-		logOut = os.Stderr
-	}
-	logger := observability.NewLogger(logOut, slog.LevelInfo)
-
-	p := newPlatform(nil, nil, logger)
-	defer func() { _ = p.bus.Close(ctx) }()
-
-	fmt.Println("======================================================================")
-	fmt.Println("  Draftea Payments Challenge — Event-Driven Modular Monolith Demo")
-	fmt.Println("======================================================================")
-
-	// ------------------------------------------------------------------
-	// Scenario 1: Happy path (async gateway + HMAC webhook) + partial refund
-	// ------------------------------------------------------------------
+func runScenario1HappyPath(ctx context.Context, demo *demoPlatform) {
 	fmt.Println("\n[1] Ruta Feliz (asincrónica con webhook HMAC) + Reembolso Parcial")
-	_, _ = p.walletSvc.CreateWallet(ctx, "wal_alice", "usr_alice", "ARS")
-	_, _ = p.walletSvc.Deposit(ctx, "wal_alice", "dep_alice_1", events.Money{Amount: 50000, Currency: "ARS"})
-	p.mockGW.SetRule("pay_happy_1", gateway.MockBehavior{SubmitOutcome: ports.GatewayOutcomeAccepted})
 
-	res1, _ := p.orchestrator.InitiatePayment(ctx, saga.InitiatePaymentRequest{
+	mustValue(demo.walletService.CreateWallet(ctx, "wal_alice", "usr_alice", "ARS"))
+	mustValue(demo.walletService.Deposit(ctx, "wal_alice", "dep_alice_1", events.Money{Amount: 50000, Currency: "ARS"}))
+	demo.mockGateway.SetRule("pay_happy_1", gateway.MockBehavior{SubmitOutcome: ports.GatewayOutcomeAccepted})
+
+	initialResult := mustValue(demo.orchestrator.InitiatePayment(ctx, saga.InitiatePaymentRequest{
 		IdempotencyKey: "idem-alice-1",
 		PaymentID:      "pay_happy_1",
 		WalletID:       "wal_alice",
@@ -218,180 +203,220 @@ func main() {
 		ServiceID:      "svc_electricity",
 		Provider:       "mockpay",
 		Amount:         events.Money{Amount: 15000, Currency: "ARS"},
-	})
-	p.drain(ctx)
+	}))
+	demo.drain(ctx)
 	fmt.Printf("    POST /v1/payments -> HTTP %d (status=%s, available=%s)\n",
-		res1.HTTPStatus, res1.Status, fmtCents(res1.AvailableBalance, "ARS"))
+		initialResult.HTTPStatus, initialResult.Status, formatCents(initialResult.AvailableBalance, "ARS"))
 
-	whBody, _ := json.Marshal(gateway.WebhookPayload{
+	webhookBody := mustValue(json.Marshal(gateway.WebhookPayload{
 		ProviderEventID: "wh_alice_001",
 		PaymentID:       "pay_happy_1",
 		Provider:        "mockpay",
 		ProviderRef:     "prov_alice_001",
 		Status:          string(ports.GatewayOutcomeApproved),
-	})
-	_ = p.gwAdapter.HandleWebhook(ctx, gateway.SignWebhook(p.webhookSecret, whBody), whBody)
-	p.drain(ctx)
+	}))
+	must(demo.gatewayAdapter.HandleWebhook(ctx, gateway.SignWebhook(demo.webhookSecret, webhookBody), webhookBody))
+	demo.drain(ctx)
 
-	pv1, _ := p.orchestrator.GetPayment(ctx, "pay_happy_1")
-	bal1, _ := p.walletSvc.GetBalance(ctx, "wal_alice")
+	paymentView := mustValue(demo.orchestrator.GetPayment(ctx, "pay_happy_1"))
+	aliceBalance := mustValue(demo.walletService.GetBalance(ctx, "wal_alice"))
 	fmt.Printf("    Webhook HMAC APPROVED -> payment=%s | balance=%s held=%s\n",
-		pv1.Status, fmtCents(bal1.Balance, "ARS"), fmtCents(bal1.Held, "ARS"))
+		paymentView.Status, formatCents(aliceBalance.Balance, "ARS"), formatCents(aliceBalance.Held, "ARS"))
 
-	_ = p.orchestrator.RequestRefund(ctx, "pay_happy_1", "ref_alice_1", events.Money{Amount: 5000, Currency: "ARS"})
-	p.drain(ctx)
-	pv1, _ = p.orchestrator.GetPayment(ctx, "pay_happy_1")
-	bal1, _ = p.walletSvc.GetBalance(ctx, "wal_alice")
+	must(demo.orchestrator.RequestRefund(ctx, "pay_happy_1", "ref_alice_1", events.Money{Amount: 5000, Currency: "ARS"}))
+	demo.drain(ctx)
+
+	paymentView = mustValue(demo.orchestrator.GetPayment(ctx, "pay_happy_1"))
+	aliceBalance = mustValue(demo.walletService.GetBalance(ctx, "wal_alice"))
 	fmt.Printf("    Reembolso parcial $50.00 -> payment=%s refunded=%s | balance=%s\n",
-		pv1.Status, fmtCents(pv1.RefundedTotal, "ARS"), fmtCents(bal1.Balance, "ARS"))
+		paymentView.Status, formatCents(paymentView.RefundedTotal, "ARS"), formatCents(aliceBalance.Balance, "ARS"))
+}
 
-	// ------------------------------------------------------------------
-	// Scenario 2: Insufficient funds immediate rejection (422)
-	// ------------------------------------------------------------------
+func runScenario2InsufficientFunds(ctx context.Context, demo *demoPlatform) {
 	fmt.Println("\n[2] Saldo Insuficiente (rechazo inmediato con espera acotada de 2s)")
-	_, _ = p.walletSvc.CreateWallet(ctx, "wal_bob", "usr_bob", "ARS")
-	_, _ = p.walletSvc.Deposit(ctx, "wal_bob", "dep_bob_1", events.Money{Amount: 5000, Currency: "ARS"})
 
-	res2, _ := p.orchestrator.InitiatePayment(ctx, saga.InitiatePaymentRequest{
+	mustValue(demo.walletService.CreateWallet(ctx, "wal_bob", "usr_bob", "ARS"))
+	mustValue(demo.walletService.Deposit(ctx, "wal_bob", "dep_bob_1", events.Money{Amount: 5000, Currency: "ARS"}))
+
+	result := mustValue(demo.orchestrator.InitiatePayment(ctx, saga.InitiatePaymentRequest{
 		PaymentID: "pay_bob_1",
 		WalletID:  "wal_bob",
 		UserID:    "usr_bob",
 		ServiceID: "svc_fiber",
 		Provider:  "mockpay",
 		Amount:    events.Money{Amount: 12000, Currency: "ARS"},
-	})
-	p.drain(ctx)
+	}))
+	demo.drain(ctx)
 	fmt.Printf("    POST /v1/payments ($120.00 vs saldo $50.00) -> HTTP %d (status=%s, reason=%s, gateway_calls=%d)\n",
-		res2.HTTPStatus, res2.Status, res2.Reason, p.mockGW.SubmitCalls("pay_bob_1"))
+		result.HTTPStatus, result.Status, result.Reason, demo.mockGateway.SubmitCalls("pay_bob_1"))
+}
 
-	// ------------------------------------------------------------------
-	// Scenario 3: Gateway timeout -> GATEWAY_UNKNOWN -> reconciliation
-	// ------------------------------------------------------------------
+func runScenario3GatewayTimeout(ctx context.Context, demo *demoPlatform) {
 	fmt.Println("\n[3] Timeout de Pasarela Externa (reintentos + backoff/jitter + conciliación)")
-	_, _ = p.walletSvc.CreateWallet(ctx, "wal_carol", "usr_carol", "ARS")
-	_, _ = p.walletSvc.Deposit(ctx, "wal_carol", "dep_carol_1", events.Money{Amount: 20000, Currency: "ARS"})
-	p.mockGW.SetRule("pay_timeout_1", gateway.MockBehavior{
+
+	mustValue(demo.walletService.CreateWallet(ctx, "wal_carol", "usr_carol", "ARS"))
+	mustValue(demo.walletService.Deposit(ctx, "wal_carol", "dep_carol_1", events.Money{Amount: 20000, Currency: "ARS"}))
+	demo.mockGateway.SetRule("pay_timeout_1", gateway.MockBehavior{
 		AlwaysTimeout: true,
 		StatusOutcome: ports.GatewayOutcomeApproved,
 	})
 
-	_, _ = p.orchestrator.InitiatePayment(ctx, saga.InitiatePaymentRequest{
+	mustValue(demo.orchestrator.InitiatePayment(ctx, saga.InitiatePaymentRequest{
 		PaymentID: "pay_timeout_1",
 		WalletID:  "wal_carol",
 		UserID:    "usr_carol",
 		ServiceID: "svc_water",
 		Provider:  "mockpay",
 		Amount:    events.Money{Amount: 8000, Currency: "ARS"},
-	})
-	p.drain(ctx)
-	pv3, _ := p.orchestrator.GetPayment(ctx, "pay_timeout_1")
-	bal3, _ := p.walletSvc.GetBalance(ctx, "wal_carol")
+	}))
+	demo.drain(ctx)
+
+	paymentView := mustValue(demo.orchestrator.GetPayment(ctx, "pay_timeout_1"))
+	carolBalance := mustValue(demo.walletService.GetBalance(ctx, "wal_carol"))
 	fmt.Printf("    Tras %d intentos con timeout -> status=%s | fondos retenidos=%s (regla de oro: no liberar sin evidencia)\n",
-		p.mockGW.SubmitCalls("pay_timeout_1"), pv3.Status, fmtCents(bal3.Held, "ARS"))
+		demo.mockGateway.SubmitCalls("pay_timeout_1"), paymentView.Status, formatCents(carolBalance.Held, "ARS"))
 
-	_ = p.orchestrator.TriggerReconciliation(ctx, "pay_timeout_1")
-	p.drain(ctx)
-	pv3, _ = p.orchestrator.GetPayment(ctx, "pay_timeout_1")
-	bal3, _ = p.walletSvc.GetBalance(ctx, "wal_carol")
+	must(demo.orchestrator.TriggerReconciliation(ctx, "pay_timeout_1"))
+	demo.drain(ctx)
+
+	paymentView = mustValue(demo.orchestrator.GetPayment(ctx, "pay_timeout_1"))
+	carolBalance = mustValue(demo.walletService.GetBalance(ctx, "wal_carol"))
 	fmt.Printf("    Conciliación GET /payments/{id} -> APPROVED -> status=%s | balance=%s held=%s\n",
-		pv3.Status, fmtCents(bal3.Balance, "ARS"), fmtCents(bal3.Held, "ARS"))
+		paymentView.Status, formatCents(carolBalance.Balance, "ARS"), formatCents(carolBalance.Held, "ARS"))
+}
 
-	// ------------------------------------------------------------------
-	// Scenario 4: Concurrent payments ($100 balance vs two $80 payments)
-	// ------------------------------------------------------------------
+func runScenario4ConcurrentPayments(ctx context.Context, demo *demoPlatform) {
 	fmt.Println("\n[4] Pagos Concurrentes ($100.00 disponibles vs 2 pagos simultáneos de $80.00)")
-	_, _ = p.walletSvc.CreateWallet(ctx, "wal_dave", "usr_dave", "ARS")
-	_, _ = p.walletSvc.Deposit(ctx, "wal_dave", "dep_dave_1", events.Money{Amount: 10000, Currency: "ARS"})
 
-	var wg sync.WaitGroup
-	start := make(chan struct{})
-	for _, pid := range []string{"pay_concurrent_A", "pay_concurrent_B"} {
+	mustValue(demo.walletService.CreateWallet(ctx, "wal_dave", "usr_dave", "ARS"))
+	mustValue(demo.walletService.Deposit(ctx, "wal_dave", "dep_dave_1", events.Money{Amount: 10000, Currency: "ARS"}))
+
+	var (
+		wg      sync.WaitGroup
+		startCh = make(chan struct{})
+		errs    = make(chan error, 2)
+	)
+	for _, paymentID := range []string{"pay_concurrent_A", "pay_concurrent_B"} {
 		wg.Add(1)
-		go func(paymentID string) {
+		go func(id string) {
 			defer wg.Done()
-			<-start
-			_, _ = p.orchestrator.InitiatePayment(ctx, saga.InitiatePaymentRequest{
-				PaymentID: paymentID,
+			<-startCh
+			if _, err := demo.orchestrator.InitiatePayment(ctx, saga.InitiatePaymentRequest{
+				PaymentID: id,
 				WalletID:  "wal_dave",
 				UserID:    "usr_dave",
 				ServiceID: "svc_mobile",
 				Provider:  "mockpay",
 				Amount:    events.Money{Amount: 8000, Currency: "ARS"},
-			})
-		}(pid)
+			}); err != nil {
+				errs <- err
+			}
+		}(paymentID)
 	}
-	close(start)
+	close(startCh)
 	wg.Wait()
-	p.drain(ctx)
+	close(errs)
+	for err := range errs {
+		must(err)
+	}
+	demo.drain(ctx)
 
-	pvA, _ := p.orchestrator.GetPayment(ctx, "pay_concurrent_A")
-	pvB, _ := p.orchestrator.GetPayment(ctx, "pay_concurrent_B")
-	balDave, _ := p.walletSvc.GetBalance(ctx, "wal_dave")
+	paymentViewA := mustValue(demo.orchestrator.GetPayment(ctx, "pay_concurrent_A"))
+	paymentViewB := mustValue(demo.orchestrator.GetPayment(ctx, "pay_concurrent_B"))
+	daveBalance := mustValue(demo.walletService.GetBalance(ctx, "wal_dave"))
 	fmt.Printf("    Pago A=%s | Pago B=%s | Saldo final=%s (sin doble gasto)\n",
-		pvA.Status, pvB.Status, fmtCents(balDave.Balance, "ARS"))
+		paymentViewA.Status, paymentViewB.Status, formatCents(daveBalance.Balance, "ARS"))
+}
 
-	// ------------------------------------------------------------------
-	// Scenario 5: System crash & recovery (rebuild read models + resume sagas)
-	// ------------------------------------------------------------------
+func runScenario5SystemRecovery(
+	ctx context.Context,
+	firstInstance *demoPlatform,
+	logger *slog.Logger,
+) (*demoPlatform, observability.MetricsReport) {
 	fmt.Println("\n[5] Recuperación del Sistema tras Reinicio (Event Store Replay + Saga Recovery)")
-	// Persist an in-flight payment in FUNDS_RESERVED simulating a crash right before gateway dispatch.
-	wCarol, _ := p.walletSvc.Load(ctx, "wal_carol")
-	_ = wCarol.Reserve("pay_recovery_1", events.Money{Amount: 5000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_recovery_1"})
-	_ = p.store.Append(ctx, wCarol.StreamID(), wCarol.BaseVersion(), wCarol.UncommittedEvents()...)
 
-	pStuck, _ := payment.Initiate(payment.InitiateParams{
+	carolWallet := mustValue(firstInstance.walletService.Load(ctx, "wal_carol"))
+	must(carolWallet.Reserve("pay_recovery_1", events.Money{Amount: 5000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_recovery_1"}))
+	must(firstInstance.store.Append(ctx, carolWallet.StreamID(), carolWallet.BaseVersion(), carolWallet.UncommittedEvents()...))
+
+	stuckPayment := mustValue(payment.Initiate(payment.InitiateParams{
 		PaymentID: "pay_recovery_1", WalletID: "wal_carol", UserID: "usr_carol", ServiceID: "svc_cloud", Provider: "mockpay",
 		Amount: events.Money{Amount: 5000, Currency: "ARS"},
-	}, events.Metadata{})
-	_ = pStuck.MarkFundsReserved(7000, events.Metadata{})
-	_ = p.store.Append(ctx, pStuck.StreamID(), 0, pStuck.UncommittedEvents()...)
+	}, events.Metadata{}))
+	must(stuckPayment.MarkFundsReserved(7000, events.Metadata{}))
+	must(firstInstance.store.Append(ctx, stuckPayment.StreamID(), 0, stuckPayment.UncommittedEvents()...))
 
-	// Snapshot metrics before shutting down instance #1, then reboot instance #2 using ONLY durable stores.
-	reportBoot1 := p.metrics.Snapshot()
-	_ = p.bus.Close(ctx)
+	firstInstanceReport := firstInstance.metrics.Snapshot()
+	must(firstInstance.bus.Close(ctx))
 
-	p2 := newPlatform(p.store, p.snapshots, logger)
-	defer func() { _ = p2.bus.Close(ctx) }()
+	recoveredInstance := newDemoPlatform(firstInstance.store, firstInstance.snapshotStore, logger)
+	replayedEvents := mustValue(recoveredInstance.projector.RebuildAll(ctx, firstInstance.store))
+	recoverySummary := mustValue(recoveredInstance.orchestrator.RecoverActiveSagas(ctx))
+	recoveredInstance.drain(ctx)
 
-	replayed, _ := p2.projector.RebuildAll(ctx, p.store)
-	rec, _ := p2.orchestrator.RecoverActiveSagas(ctx)
-	p2.drain(ctx)
-
-	pvRec, _ := p2.orchestrator.GetPayment(ctx, "pay_recovery_1")
-	balCarolAfter, _ := p2.walletSvc.GetBalance(ctx, "wal_carol")
+	recoveredView := mustValue(recoveredInstance.orchestrator.GetPayment(ctx, "pay_recovery_1"))
+	carolBalance := mustValue(recoveredInstance.walletService.GetBalance(ctx, "wal_carol"))
 	fmt.Printf("    Read Models reconstruidos (%d eventos reproducidos) | Sagas escaneadas=%d retomadas=%d\n",
-		replayed, rec.Scanned, rec.Resumed)
+		replayedEvents, recoverySummary.Scanned, recoverySummary.Resumed)
 	fmt.Printf("    pay_recovery_1 tras recovery -> status=%s | saldo Carol=%s held=%s\n",
-		pvRec.Status, fmtCents(balCarolAfter.Balance, "ARS"), fmtCents(balCarolAfter.Held, "ARS"))
+		recoveredView.Status, formatCents(carolBalance.Balance, "ARS"), formatCents(carolBalance.Held, "ARS"))
 
-	// ------------------------------------------------------------------
-	// Observability: Health Checks & Metrics
-	// ------------------------------------------------------------------
+	return recoveredInstance, firstInstanceReport
+}
+
+func printObservabilitySummary(ctx context.Context, demo *demoPlatform, report observability.MetricsReport) {
 	fmt.Println("\n[Observabilidad] Health Checks (/healthz, /readyz) y Métricas")
-	live := p2.health.Liveness()
-	ready, checks := p2.health.Readiness(ctx)
-	fmt.Printf("    /healthz: healthy=%v | /readyz: ready=%v (", live.Healthy, ready)
-	for i, c := range checks {
-		if i > 0 {
+
+	liveness := demo.health.Liveness()
+	ready, checks := demo.health.Readiness(ctx)
+	fmt.Printf("    /healthz: healthy=%v | /readyz: ready=%v (", liveness.Healthy, ready)
+	for index, check := range checks {
+		if index > 0 {
 			fmt.Print(", ")
 		}
-		fmt.Printf("%s=%v", c.Name, c.Healthy)
+		fmt.Printf("%s=%v", check.Name, check.Healthy)
 	}
 	fmt.Println(")")
 
+	dlqCount := len(demo.bus.DeadLetters(events.TopicWalletsCommands)) + len(demo.bus.DeadLetters(events.TopicGatewayCommands))
 	fmt.Printf("    Métricas (instancia 1): initiated=%d completed=%d rejected=%d failed=%d refunded=%d success_rate=%.0f%% volume=%s\n",
-		reportBoot1.PaymentsInitiated,
-		reportBoot1.PaymentsCompleted,
-		reportBoot1.PaymentsRejected,
-		reportBoot1.PaymentsFailed,
-		reportBoot1.PaymentsRefunded,
-		reportBoot1.SuccessRate*100,
-		fmtCents(reportBoot1.VolumeByCurrency["ARS"], "ARS"),
+		report.PaymentsInitiated,
+		report.PaymentsCompleted,
+		report.PaymentsRejected,
+		report.PaymentsFailed,
+		report.PaymentsRefunded,
+		report.SuccessRate*100,
+		formatCents(report.VolumeByCurrency["ARS"], "ARS"),
 	)
 	fmt.Printf("    Operativas: insufficient_funds=%d circuit_breaker=%s dlq_msgs=%d\n",
-		reportBoot1.InsufficientFundsCount,
-		reportBoot1.CircuitBreakerStates["mockpay"],
-		len(p2.bus.DeadLetters(events.TopicWalletsCommands))+len(p2.bus.DeadLetters(events.TopicGatewayCommands)),
+		report.InsufficientFundsCount,
+		report.CircuitBreakerStates["mockpay"],
+		dlqCount,
 	)
+}
+
+func main() {
+	ctx := context.Background()
+
+	var logOutput io.Writer = io.Discard
+	if os.Getenv("DEMO_LOGS") == "1" {
+		logOutput = os.Stderr
+	}
+	logger := observability.NewLogger(logOutput, slog.LevelInfo)
+
+	firstInstance := newDemoPlatform(nil, nil, logger)
+
+	fmt.Println("======================================================================")
+	fmt.Println("  Draftea Payments Challenge — Event-Driven Modular Monolith Demo")
+	fmt.Println("======================================================================")
+
+	runScenario1HappyPath(ctx, firstInstance)
+	runScenario2InsufficientFunds(ctx, firstInstance)
+	runScenario3GatewayTimeout(ctx, firstInstance)
+	runScenario4ConcurrentPayments(ctx, firstInstance)
+	recoveredInstance, firstInstanceReport := runScenario5SystemRecovery(ctx, firstInstance, logger)
+	defer func() { _ = recoveredInstance.bus.Close(ctx) }()
+
+	printObservabilitySummary(ctx, recoveredInstance, firstInstanceReport)
 	fmt.Println("======================================================================")
 }

@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/besednjak/draftea-payments-challenge/internal/application/ports"
 	"github.com/besednjak/draftea-payments-challenge/internal/domain/events"
 	"github.com/besednjak/draftea-payments-challenge/internal/domain/payment"
 )
@@ -80,11 +81,11 @@ func (c *Collector) HandleEvent(_ context.Context, env events.Envelope) error {
 		c.mu.Unlock()
 
 	case events.EventPaymentCompleted:
-		d, err := events.DecodePayload[events.PaymentCompletedPayload](env)
+		payload, err := events.DecodePayload[events.PaymentCompletedPayload](env)
 		if err != nil {
-			return err
+			return ports.NonRetryable(err)
 		}
-		c.RecordPaymentOutcome(string(payment.StatusCompleted), d.CapturedAmount, d.Currency)
+		c.RecordPaymentOutcome(string(payment.StatusCompleted), payload.CapturedAmount, payload.Currency)
 		c.observeEndToEndLatency(env.AggregateID, env.OccurredAt)
 
 	case events.EventPaymentFailed:
@@ -106,18 +107,18 @@ func (c *Collector) HandleEvent(_ context.Context, env events.Envelope) error {
 		c.mu.Unlock()
 
 	case events.EventPaymentRefunded:
-		d, err := events.DecodePayload[events.PaymentRefundedPayload](env)
+		payload, err := events.DecodePayload[events.PaymentRefundedPayload](env)
 		if err != nil {
-			return err
+			return ports.NonRetryable(err)
 		}
-		c.RecordRefund(d.Amount.Amount, d.Amount.Currency)
+		c.RecordRefund(payload.Amount.Amount, payload.Amount.Currency)
 
 	case events.EventFundsReservationRejected:
-		d, err := events.DecodePayload[events.FundsReservationRejectedPayload](env)
+		payload, err := events.DecodePayload[events.FundsReservationRejectedPayload](env)
 		if err != nil {
-			return err
+			return ports.NonRetryable(err)
 		}
-		if d.Reason == events.ReasonInsufficientFunds {
+		if payload.Reason == events.ReasonInsufficientFunds {
 			c.RecordInsufficientFunds(env.AggregateID)
 		}
 	}
@@ -126,18 +127,16 @@ func (c *Collector) HandleEvent(_ context.Context, env events.Envelope) error {
 
 func (c *Collector) observeEndToEndLatency(paymentID string, finishedAt time.Time) {
 	c.mu.Lock()
-	startedAt, ok := c.paymentStartedAt[paymentID]
-	if ok {
+	startedAt, exists := c.paymentStartedAt[paymentID]
+	if exists {
 		delete(c.paymentStartedAt, paymentID)
 	}
 	c.mu.Unlock()
 
-	if ok && !finishedAt.Before(startedAt) {
+	if exists && !finishedAt.Before(startedAt) {
 		c.RecordPaymentLatency(finishedAt.Sub(startedAt))
 	}
 }
-
-// --- ports.MetricsRecorder implementation ---
 
 func (c *Collector) RecordPaymentOutcome(status string, amount int64, currency string) {
 	c.mu.Lock()
@@ -156,14 +155,14 @@ func (c *Collector) RecordPaymentOutcome(status string, amount int64, currency s
 	}
 }
 
-func (c *Collector) RecordPaymentLatency(d time.Duration) {
+func (c *Collector) RecordPaymentLatency(elapsed time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.latencySamples++
-	c.totalLatency += d
-	if d > c.maxLatency {
-		c.maxLatency = d
+	c.totalLatency += elapsed
+	if elapsed > c.maxLatency {
+		c.maxLatency = elapsed
 	}
 }
 

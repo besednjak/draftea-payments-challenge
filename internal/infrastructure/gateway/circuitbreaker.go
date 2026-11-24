@@ -194,8 +194,8 @@ func (cb *CircuitBreaker) shouldOpenLocked() bool {
 		return false
 	}
 	failures := 0
-	for _, f := range cb.window {
-		if f {
+	for _, failed := range cb.window {
+		if failed {
 			failures++
 		}
 	}
