@@ -206,6 +206,9 @@ func (a *Adapter) handleSubmitPayment(ctx context.Context, env events.Envelope) 
 	if err != nil {
 		return ports.NonRetryable(err)
 	}
+	// A recovery resubmission or a payment already attempted by this adapter may have reached
+	// the provider, so blocking it locally must never be reported as certain non-delivery.
+	possiblySent := cmd.Resubmission || a.paymentWasAttempted(cmd.PaymentID)
 	ctx = ports.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, "")
 	meta := events.Metadata{
 		CorrelationID: cmd.PaymentID,
@@ -217,7 +220,7 @@ func (a *Adapter) handleSubmitPayment(ctx context.Context, env events.Envelope) 
 	case a.bulkhead <- struct{}{}:
 		defer func() { <-a.bulkhead }()
 	default:
-		if a.paymentWasAttempted(cmd.PaymentID) {
+		if possiblySent {
 			return a.emit(ctx, events.EventGatewayOutcomeUnknown, cmd.PaymentID, events.GatewayOutcomeUnknownPayload{
 				PaymentID: cmd.PaymentID,
 				Provider:  cmd.Provider,
@@ -236,7 +239,7 @@ func (a *Adapter) handleSubmitPayment(ctx context.Context, env events.Envelope) 
 
 	for attempt := 0; attempt < a.retry.MaxAttempts; attempt++ {
 		if err := a.breaker.Allow(); err != nil {
-			if !sentAnyAttempt && !a.paymentWasAttempted(cmd.PaymentID) {
+			if !sentAnyAttempt && !possiblySent {
 				// Certainty of non-delivery (never sent in this or any previous delivery): safe to release funds.
 				return a.emit(ctx, events.EventGatewaySubmissionNotSent, cmd.PaymentID, events.GatewaySubmissionNotSentPayload{
 					PaymentID: cmd.PaymentID,

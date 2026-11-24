@@ -39,6 +39,8 @@ Organizada siguiendo los 6 entregables del enunciado:
 | **At-least-once + idempotencia en 3 niveles** | Clave en API (`Idempotency-Key`), Inbox en consumidores (`event_id`) y clave ante la pasarela (`payment_id`) |
 | **Espera de hasta 2s en la API** | Permite devolver `422` inmediato por saldo insuficiente, o `202 Accepted` si demora más |
 
+> **Nota:** esta tabla refleja el **diseño objetivo de producción**. Lo que la Parte 2 simula o simplifica (HTTP, Outbox, Kafka, PostgreSQL) está detallado en [Implementado en Parte 2 vs Diseño de Producción](#implementado-en-parte-2-vs-diseño-de-producción).
+
 ---
 
 ## Estructura del proyecto (Parte 2)
@@ -99,7 +101,9 @@ La Parte 2 se acotó conscientemente al alcance de ~4 horas. Las invariantes fin
 | Inbox `processed_messages` en PostgreSQL (misma transacción) | Inbox en memoria con **rollback** (`UnmarkProcessed`) si el handler falla |
 | Conciliación periódica (`1m, 5m, 15m…` hasta 24h) | Conciliación disparada explícitamente (`TriggerReconciliation`, `ExpireReconciliationWindow`), sin ticker de fondo |
 | Kafka con particiones por topic | Bus en memoria con **particiones compartidas** entre topics (mismo orden FIFO por clave) |
-| Recuperación de todos los consumidores por offset | Recovery enfocado en pagos: `RebuildAll` de read models + `RecoverActiveSagas` sobre streams `payment-*` |
+| Recuperación de todos los consumidores por offset | Recovery enfocado en pagos: `RebuildAll` de read models + `RecoverActiveSagas` sobre streams `payment-*` (re-emite `SubmitPayment` con `Resubmission=true`, que nunca se reporta como `NotSent`) |
+| Conciliación de reembolsos inciertos con el proveedor | Un reembolso con timeout o breaker abierto mantiene el monto reservado en `Payment` y su comando queda en la DLQ para *redrive* manual; `RecoverActiveSagas` **no** retoma reembolsos |
+| Tablas `gateway_attempts` / `gateway_webhooks` en PostgreSQL | `attemptedPayments`, `attemptedRefunds` y `seenWebhooks` del Gateway Adapter viven en memoria y se pierden al reiniciar (por eso la recovery marca `Resubmission=true`) |
 
 ### Escenarios del enunciado → tests
 

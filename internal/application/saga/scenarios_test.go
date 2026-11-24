@@ -1439,3 +1439,73 @@ func TestRegressionLateReserveAfterRejectionLeavesNoOrphanHold(t *testing.T) {
 		}
 	})
 }
+
+func TestRegressionRecoveryResubmitWithOpenBreakerEndsGatewayUnknown(t *testing.T) {
+	ctx := context.Background()
+	durableStore := eventstore.NewInMemoryEventStore()
+	durableSnapshots := eventstore.NewInMemorySnapshotStore()
+
+	// Boot #1: persist a payment in FUNDS_RESERVED whose SubmitPayment may have reached the provider before the crash.
+	firstInstance := newTestSystem(t, gateway.MockBehavior{SubmitOutcome: ports.GatewayOutcomeApproved}, durableStore, durableSnapshots)
+	firstInstance.mustCreateFundedWallet(t, "wal_res", "usr_res", 10000)
+
+	crashedWallet, err := firstInstance.walletService.Load(ctx, "wal_res")
+	if err != nil {
+		t.Fatalf("Load wallet failed: %v", err)
+	}
+	if err := crashedWallet.Reserve("pay_res", events.Money{Amount: 6000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_res"}); err != nil {
+		t.Fatalf("seed Reserve failed: %v", err)
+	}
+	if err := durableStore.Append(ctx, crashedWallet.StreamID(), crashedWallet.BaseVersion(), crashedWallet.UncommittedEvents()...); err != nil {
+		t.Fatalf("append wallet reservation failed: %v", err)
+	}
+	reservedPayment, err := payment.Initiate(payment.InitiateParams{
+		PaymentID: "pay_res", WalletID: "wal_res", UserID: "usr_res", ServiceID: "svc_1", Provider: "mockpay",
+		Amount: events.Money{Amount: 6000, Currency: "ARS"},
+	}, events.Metadata{})
+	if err != nil {
+		t.Fatalf("Initiate failed: %v", err)
+	}
+	if err := reservedPayment.MarkFundsReserved(4000, events.Metadata{}); err != nil {
+		t.Fatalf("MarkFundsReserved failed: %v", err)
+	}
+	if err := durableStore.Append(ctx, reservedPayment.StreamID(), 0, reservedPayment.UncommittedEvents()...); err != nil {
+		t.Fatalf("append payment failed: %v", err)
+	}
+	if err := firstInstance.bus.Close(ctx); err != nil {
+		t.Fatalf("close first instance bus failed: %v", err)
+	}
+
+	// Boot #2: fresh adapter (empty attemptedPayments) with the breaker open while recovery resubmits.
+	recoveredInstance := newTestSystem(t, gateway.MockBehavior{SubmitOutcome: ports.GatewayOutcomeApproved}, durableStore, durableSnapshots)
+	for i := 0; i < 5; i++ {
+		recoveredInstance.breaker.RecordFailure(true)
+	}
+
+	summary, err := recoveredInstance.orchestrator.RecoverActiveSagas(ctx)
+	if err != nil {
+		t.Fatalf("RecoverActiveSagas failed: %v", err)
+	}
+	recoveredInstance.drain(t)
+
+	if summary.Scanned != 1 || summary.Resumed != 1 {
+		t.Fatalf("expected 1 scanned and 1 resumed saga, got %+v", summary)
+	}
+	if calls := recoveredInstance.mockGateway.SubmitCalls("pay_res"); calls != 0 {
+		t.Fatalf("open breaker must block the outbound call, got %d calls", calls)
+	}
+	loadedPayment, err := recoveredInstance.orchestrator.Load(ctx, "pay_res")
+	if err != nil {
+		t.Fatalf("Load payment failed: %v", err)
+	}
+	if loadedPayment.Status() != payment.StatusGatewayUnknown {
+		t.Fatalf("expected GATEWAY_UNKNOWN (never FAILED) after recovery resubmission, got %s", loadedPayment.Status())
+	}
+	loadedWallet, err := recoveredInstance.walletService.Load(ctx, "wal_res")
+	if err != nil {
+		t.Fatalf("Load wallet failed: %v", err)
+	}
+	if loadedWallet.Held() != 6000 || loadedWallet.Available() != 4000 {
+		t.Fatalf("funds must stay held pending reconciliation, held=%d available=%d", loadedWallet.Held(), loadedWallet.Available())
+	}
+}

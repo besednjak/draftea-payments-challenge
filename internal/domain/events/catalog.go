@@ -104,6 +104,9 @@ type SubmitPaymentCommand struct {
 	Provider  string `json:"provider"`
 	ServiceID string `json:"service_id"`
 	Amount    Money  `json:"amount"`
+	// Resubmission marks a command re-emitted by saga recovery: a previous delivery may already
+	// have reached the provider, so the adapter must never report it as NotSent.
+	Resubmission bool `json:"resubmission,omitempty"`
 }
 
 type CheckPaymentStatusCommand struct {

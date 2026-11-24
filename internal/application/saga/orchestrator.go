@@ -226,8 +226,12 @@ func (o *PaymentOrchestrator) InitiatePayment(ctx context.Context, req InitiateP
 	}
 
 	if err := o.publishPaymentEvents(ctx, initiated.ID(), uncommitted); err != nil {
+		// PaymentInitiated is already durable: answer exactly like a retry would (202 PENDING)
+		// and let RecoverActiveSagas resume the saga instead of failing an existing payment.
+		ports.LoggerFromContext(ctx, o.logger).Warn("payment persisted but publish failed; recovery will resume it",
+			"error", err.Error())
 		completeIdempotency(result)
-		return InitiatePaymentResult{}, err
+		return result, nil
 	}
 
 	// Register waiter before dispatching ReserveFunds to eliminate missed signals.
@@ -249,8 +253,12 @@ func (o *PaymentOrchestrator) InitiatePayment(ctx context.Context, req InitiateP
 			Amount:    initiated.Amount(),
 		},
 	); err != nil {
+		// PaymentInitiated is already durable: answer exactly like a retry would (202 PENDING)
+		// and let RecoverActiveSagas resume the saga instead of failing an existing payment.
+		ports.LoggerFromContext(ctx, o.logger).Warn("payment persisted but publish failed; recovery will resume it",
+			"error", err.Error())
 		completeIdempotency(result)
-		return InitiatePaymentResult{}, err
+		return result, nil
 	}
 
 	timer := time.NewTimer(o.syncReserveWait)
@@ -882,10 +890,11 @@ func (o *PaymentOrchestrator) RecoverActiveSagas(ctx context.Context) (RecoveryS
 				loaded.ID(),
 				"recovery",
 				events.SubmitPaymentCommand{
-					PaymentID: loaded.ID(),
-					Provider:  loaded.Provider(),
-					ServiceID: loaded.ServiceID(),
-					Amount:    loaded.Amount(),
+					PaymentID:    loaded.ID(),
+					Provider:     loaded.Provider(),
+					ServiceID:    loaded.ServiceID(),
+					Amount:       loaded.Amount(),
+					Resubmission: true,
 				},
 			)
 		case payment.StatusSubmitted, payment.StatusGatewayUnknown:
