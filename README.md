@@ -5,7 +5,7 @@ Diseño e implementación de un sistema de pagos orientado a eventos donde los u
 | Parte | Estado | Entregables |
 |---|---|---|
 | **Parte 1: Diseño de arquitectura** | ✅ Completa | Documentación en [`docs/`](docs/) |
-| **Parte 2: Implementación** | 🚧 En curso | Monolito modular en Go (`cmd/`, `internal/`) |
+| **Parte 2: Implementación** | ✅ Completa | Monolito modular en Go (`cmd/`, `internal/`) |
 
 ---
 
@@ -53,8 +53,9 @@ Organizada siguiendo los 6 entregables del enunciado:
 │   │   ├── payment/           # Aggregate Payment y máquina de estados
 │   │   └── wallet/            # Aggregate Wallet e invariantes de saldo
 │   ├── application/
-│   │   ├── ports/             # Interfaces (EventStore, EventBus, Gateway, ReadModels)
-│   │   └── saga/              # Orquestador de la saga de pagos
+│   │   ├── ports/             # Interfaces segregadas (EventStore, EventBus, Gateway, ReadModels)
+│   │   ├── wallet/            # Servicio de Wallet (comandos, optimistic locking + retry, snapshots)
+│   │   └── saga/              # Orquestador de la saga de pagos, conciliación y recovery
 │   ├── infrastructure/        # Implementaciones en memoria y mocks
 │   │   ├── eventstore/        # Event Store con optimistic locking y snapshots
 │   │   ├── eventbus/          # Bus en memoria particionado por clave
@@ -69,19 +70,20 @@ Organizada siguiendo los 6 entregables del enunciado:
 
 ## Cómo ejecutar
 
-> La Parte 2 se encuentra en desarrollo; los comandos estarán disponibles al completar la implementación.
-
-**Requisitos:** Go 1.25+.
+**Requisitos:** Go 1.25.2+ (sin dependencias externas; solo librería estándar).
 
 ```bash
-# Ejecutar pruebas unitarias
-go test ./...
+# Análisis estático
+go vet ./...
 
-# Ejecutar pruebas con detector de race conditions y cobertura
+# Ejecutar pruebas unitarias e integración con detector de race conditions y cobertura
 go test -race -cover ./...
 
-# Ejecutar demostración de escenarios
+# Ejecutar demostración de los 5 escenarios, métricas y health checks
 go run ./cmd/demo
+
+# Opcional: habilitar logs estructurados JSON (slog) durante la demo
+DEMO_LOGS=1 go run ./cmd/demo
 ```
 
 ---
