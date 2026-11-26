@@ -92,7 +92,7 @@ DEMO_LOGS=1 go run ./cmd/demo
 
 ## Implementado en Parte 2 vs Diseño de Producción
 
-La Parte 2 se acotó conscientemente al alcance de ~4 horas. Las invariantes financieras (saldo no negativo, nunca liberar sin evidencia negativa, reembolsos acotados a lo capturado) se respetan igual, pero algunas piezas de infraestructura se simplificaron respecto del diseño de [`docs/`](docs/):
+La Parte 2 se acotó conscientemente al alcance de ~4 horas. Los invariantes financieros (saldo no negativo, nunca liberar sin evidencia negativa, reembolsos acotados a lo capturado) se respetan igual, pero algunas piezas de infraestructura se simplificaron respecto del diseño de [`docs/`](docs/):
 
 | Diseño de producción (Parte 1) | Implementación en Parte 2 |
 |---|---|
@@ -120,6 +120,8 @@ Todos en [`internal/application/saga/scenarios_test.go`](internal/application/sa
 | 3 | Timeout de pasarela (conciliación, compensación, circuit breaker) | `TestScenario3_GatewayTimeoutReconciliationAndCircuitBreaker` |
 | 4 | Pagos concurrentes sin doble gasto | `TestScenario4_ConcurrentPaymentsNoDoubleSpend` |
 | 5 | Recuperación tras reinicio | `TestScenario5_SystemRecoveryRebuildAndResumeActiveSagas` |
+
+Además de los 5 escenarios principales, la suite incluye tests de regresión para evidencia contradictoria, ownership de billetera y reenvíos post-reinicio, junto con una verificación automática en `t.Cleanup` que valida invariantes globales del ledger y DLQs vacías al finalizar cada test.
 
 ---
 
