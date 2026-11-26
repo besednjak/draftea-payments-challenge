@@ -5,7 +5,7 @@ Diseño e implementación de un sistema de pagos orientado a eventos donde los u
 | Parte | Estado | Entregables |
 |---|---|---|
 | **Parte 1: Diseño de arquitectura** | ✅ Completa | Documentación en [`docs/`](docs/) |
-| **Parte 2: Implementación** | 🚧 En curso | Monolito modular en Go (`cmd/`, `internal/`) |
+| **Parte 2: Implementación** | ✅ Completa | Monolito modular en Go (`cmd/`, `internal/`) |
 
 ---
 
@@ -39,6 +39,8 @@ Organizada siguiendo los 6 entregables del enunciado:
 | **At-least-once + idempotencia en 3 niveles** | Clave en API (`Idempotency-Key`), Inbox en consumidores (`event_id`) y clave ante la pasarela (`payment_id`) |
 | **Espera de hasta 2s en la API** | Permite devolver `422` inmediato por saldo insuficiente, o `202 Accepted` si demora más |
 
+> **Nota:** esta tabla refleja el **diseño objetivo de producción**. Lo que la Parte 2 simula o simplifica (HTTP, Outbox, Kafka, PostgreSQL) está detallado en [Implementado en Parte 2 vs Diseño de Producción](#implementado-en-parte-2-vs-diseño-de-producción).
+
 ---
 
 ## Estructura del proyecto (Parte 2)
@@ -53,8 +55,9 @@ Organizada siguiendo los 6 entregables del enunciado:
 │   │   ├── payment/           # Aggregate Payment y máquina de estados
 │   │   └── wallet/            # Aggregate Wallet e invariantes de saldo
 │   ├── application/
-│   │   ├── ports/             # Interfaces (EventStore, EventBus, Gateway, ReadModels)
-│   │   └── saga/              # Orquestador de la saga de pagos
+│   │   ├── ports/             # Interfaces segregadas (EventStore, EventBus, Gateway, ReadModels)
+│   │   ├── wallet/            # Servicio de Wallet (comandos, optimistic locking + retry, snapshots)
+│   │   └── saga/              # Orquestador de la saga de pagos, conciliación y recovery
 │   ├── infrastructure/        # Implementaciones en memoria y mocks
 │   │   ├── eventstore/        # Event Store con optimistic locking y snapshots
 │   │   ├── eventbus/          # Bus en memoria particionado por clave
@@ -69,23 +72,57 @@ Organizada siguiendo los 6 entregables del enunciado:
 
 ## Cómo ejecutar
 
-> La Parte 2 se encuentra en desarrollo; los comandos estarán disponibles al completar la implementación.
-
-**Requisitos:** Go 1.25+.
+**Requisitos:** Go 1.22+ (sin dependencias externas; solo librería estándar).
 
 ```bash
-# Ejecutar pruebas unitarias
-go test ./...
+# Análisis estático
+go vet ./...
 
-# Ejecutar pruebas con detector de race conditions y cobertura
+# Ejecutar pruebas unitarias e integración con detector de race conditions y cobertura
 go test -race -cover ./...
 
-# Ejecutar demostración de escenarios
+# Ejecutar demostración de los 5 escenarios, métricas y health checks
 go run ./cmd/demo
+
+# Opcional: habilitar logs estructurados JSON (slog) durante la demo
+DEMO_LOGS=1 go run ./cmd/demo
 ```
+
+---
+
+## Implementado en Parte 2 vs Diseño de Producción
+
+La Parte 2 se acotó conscientemente al alcance de ~4 horas. Las invariantes financieras (saldo no negativo, nunca liberar sin evidencia negativa, reembolsos acotados a lo capturado) se respetan igual, pero algunas piezas de infraestructura se simplificaron respecto del diseño de [`docs/`](docs/):
+
+| Diseño de producción (Parte 1) | Implementación en Parte 2 |
+|---|---|
+| API HTTP (`POST /v1/payments`, `GET /healthz`, etc.) | Sin servidor HTTP: los casos de uso se invocan directamente desde `cmd/demo` y los tests (`HTTPStatus` modela la respuesta `202`/`422`) |
+| Transactional Outbox con worker de polling | *Publish-after-append* con **republish-on-retry**: si `Publish` falla después de `Append`, el reintento detecta el efecto ya persistido y republica el evento/comando |
+| Inbox `processed_messages` en PostgreSQL (misma transacción) | Inbox en memoria con **rollback** (`UnmarkProcessed`) si el handler falla |
+| Conciliación periódica (`1m, 5m, 15m…` hasta 24h) | Conciliación disparada explícitamente (`TriggerReconciliation`, `ExpireReconciliationWindow`), sin ticker de fondo |
+| Kafka con particiones por topic | Bus en memoria con **particiones compartidas** entre topics (mismo orden FIFO por clave) |
+| Recuperación de todos los consumidores por offset | Recovery enfocado en pagos: `RebuildAll` de read models + `RecoverActiveSagas` sobre streams `payment-*` (re-emite `SubmitPayment` con `Resubmission=true`, que nunca se reporta como `NotSent`) |
+| Conciliación de reembolsos inciertos con el proveedor | Un reembolso con timeout o breaker abierto mantiene el monto reservado en `Payment` y su comando queda en la DLQ para *redrive* manual; `RecoverActiveSagas` **no** retoma reembolsos |
+| Tablas `gateway_attempts` / `gateway_webhooks` en PostgreSQL | `attemptedPayments`, `attemptedRefunds` y `seenWebhooks` del Gateway Adapter viven en memoria y se pierden al reiniciar (por eso la recovery marca `Resubmission=true`) |
+| Contratos/schemas versionados por servicio | *Shared kernel* en `internal/domain/events` para evitar mapeo repetitivo en el alcance de 4 horas (`wallet` y `payment` siguen sin importarse entre sí) |
+| Un circuit breaker por proveedor externo | Instancia única de `CircuitBreaker` en la simulación (el diseño soporta un mapa por `provider` detrás del mismo puerto) |
+| Estado intermedio `ReleaseRequested` ante carrera `Declined` vs `Approved` | La carrera se resuelve atómicamente en el aggregate `Wallet` (una reserva capturada no puede liberarse y viceversa), evitando un estado extra |
+| Tablas de deduplicación con TTL/retención | Mapas en memoria sin cota (`InboxStore`, `seenEvents`, `seenWebhooks`, `attempted*`) suficientes para tests y demo |
+
+### Escenarios del enunciado → tests
+
+Todos en [`internal/application/saga/scenarios_test.go`](internal/application/saga/scenarios_test.go):
+
+| # | Escenario | Test |
+|---|---|---|
+| 1 | Ruta feliz (+ reembolsos) | `TestScenario1_HappyPathWebhookAndRefunds` |
+| 2 | Saldo insuficiente | `TestScenario2_InsufficientFundsImmediateRejection` |
+| 3 | Timeout de pasarela (conciliación, compensación, circuit breaker) | `TestScenario3_GatewayTimeoutReconciliationAndCircuitBreaker` |
+| 4 | Pagos concurrentes sin doble gasto | `TestScenario4_ConcurrentPaymentsNoDoubleSpend` |
+| 5 | Recuperación tras reinicio | `TestScenario5_SystemRecoveryRebuildAndResumeActiveSagas` |
 
 ---
 
 ## Uso de IA
 
-El diseño arquitectónico se trabajó iterativamente con un asistente de IA, debatiendo trade-offs antes de documentar. Siguiendo las indicaciones del enunciado, el historial de conversación se guarda en [`ai-history/`](ai-history/).
+Tanto el diseño arquitectónico como la implementación en Go y la revisión final del código se trabajaron iterativamente con asistentes de IA, debatiendo trade-offs y validando invariantes antes de consolidar cada bloque. Siguiendo las indicaciones del enunciado, el historial completo de conversación (diseño, implementación y revisión) se guarda en [`ai-history/`](ai-history/).

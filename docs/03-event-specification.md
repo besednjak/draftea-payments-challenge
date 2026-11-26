@@ -97,6 +97,8 @@ Todos los eventos y comandos comparten el mismo sobre JSON para garantizar traza
 | `PaymentManualReviewRequired` | Vence la ventana de conciliación (24h) sin evidencia | `MANUAL_REVIEW` |
 | `PaymentCompleted` | Aprobado por pasarela y capturado en `Wallet` | `COMPLETED` |
 | `PaymentFailed` | Rechazado/no enviado y reserva liberada en `Wallet` | `FAILED` |
+| `PaymentRefundRequested` | Se solicita un reembolso válido y se reserva el monto en vuelo | `COMPLETED` *(con saldo reembolsable reducido)* |
+| `PaymentRefundDeclined` | La pasarela rechaza explícitamente el reembolso y se libera el monto en vuelo | `COMPLETED` |
 | `PaymentRefunded` | Reembolso aprobado y acreditado en `Wallet` | `REFUNDED` *(o permanece `COMPLETED` si fue parcial)* |
 
 ### 3.4 Eventos de Gateway Adapter (`gateway.events.v1`)

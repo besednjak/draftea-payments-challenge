@@ -1,0 +1,545 @@
+package gateway
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/besednjak/draftea-payments-challenge/internal/application/ports"
+	"github.com/besednjak/draftea-payments-challenge/internal/domain/events"
+)
+
+const gatewayConsumerName = "gateway-adapter"
+
+// ErrWebhookSecretNotConfigured is returned when HandleWebhook is called without a configured HMAC secret.
+var ErrWebhookSecretNotConfigured = errors.New("webhook HMAC secret is not configured")
+
+// WebhookPayload represents a normalized provider callback authenticated with HMAC.
+type WebhookPayload struct {
+	ProviderEventID string `json:"provider_event_id"`
+	PaymentID       string `json:"payment_id"`
+	Provider        string `json:"provider"`
+	ProviderRef     string `json:"provider_ref,omitempty"`
+	Status          string `json:"status"`
+	Reason          string `json:"reason,omitempty"`
+}
+
+// AdapterConfig wires the Anti-Corruption Layer around an external PaymentGateway.
+type AdapterConfig struct {
+	Gateway       ports.PaymentGateway
+	Publisher     ports.EventPublisher
+	Inbox         ports.InboxStore
+	Breaker       *CircuitBreaker
+	Retry         RetryConfig
+	BulkheadLimit int
+	WebhookSecret string
+	Logger        *slog.Logger
+	Metrics       ports.MetricsRecorder
+	Clock         events.Clock
+	IDGenerator   events.IDGenerator
+}
+
+// Adapter translates gateway.commands.v1 into external provider calls protected by
+// bulkhead, circuit breaker, and exponential backoff + jitter, and emits normalized
+// events on gateway.events.v1.
+type Adapter struct {
+	gatewayClient ports.PaymentGateway
+	publisher     ports.EventPublisher
+	inbox         ports.InboxStore
+	breaker       *CircuitBreaker
+	retry         RetryConfig
+	bulkhead      chan struct{}
+	webhookSecret string
+	logger        *slog.Logger
+	metrics       ports.MetricsRecorder
+	clock         events.Clock
+	idGen         events.IDGenerator
+
+	webhookMu    sync.Mutex
+	seenWebhooks map[string]struct{}
+
+	// attemptedPayments/attemptedRefunds remember which IDs already went over the wire at
+	// least once, so a later retry blocked by the breaker or bulkhead never claims non-delivery.
+	attemptMu         sync.Mutex
+	attemptedPayments map[string]struct{}
+	attemptedRefunds  map[string]struct{}
+}
+
+// NewAdapter creates a Gateway Adapter ACL.
+func NewAdapter(cfg AdapterConfig) *Adapter {
+	limit := cfg.BulkheadLimit
+	if limit <= 0 {
+		limit = 50
+	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.New(slog.NewJSONHandler(io.Discard, nil))
+	}
+	breaker := cfg.Breaker
+	if breaker == nil {
+		breaker = NewCircuitBreaker(CircuitBreakerConfig{})
+	}
+	clock := cfg.Clock
+	if clock == nil {
+		clock = events.DefaultClock
+	}
+	idGen := cfg.IDGenerator
+	if idGen == nil {
+		idGen = events.NewUUID
+	}
+
+	return &Adapter{
+		gatewayClient:     cfg.Gateway,
+		publisher:         cfg.Publisher,
+		inbox:             cfg.Inbox,
+		breaker:           breaker,
+		retry:             cfg.Retry.withDefaults(),
+		bulkhead:          make(chan struct{}, limit),
+		webhookSecret:     cfg.WebhookSecret,
+		logger:            logger,
+		metrics:           cfg.Metrics,
+		clock:             clock,
+		idGen:             idGen,
+		seenWebhooks:      make(map[string]struct{}),
+		attemptedPayments: make(map[string]struct{}),
+		attemptedRefunds:  make(map[string]struct{}),
+	}
+}
+
+// HandleCommand consumes commands from gateway.commands.v1.
+func (a *Adapter) HandleCommand(ctx context.Context, env events.Envelope) (retErr error) {
+	if a.inbox != nil && env.EventID != "" {
+		alreadyProcessed, err := a.inbox.TryMarkProcessed(ctx, gatewayConsumerName, env.EventID)
+		if err != nil {
+			return err
+		}
+		if alreadyProcessed {
+			return nil
+		}
+		defer func() {
+			if retErr != nil {
+				_ = a.inbox.UnmarkProcessed(ctx, gatewayConsumerName, env.EventID)
+			}
+		}()
+	}
+
+	ctx = ports.WithCorrelation(ctx, env.CorrelationID, env.AggregateID, "")
+
+	switch env.Type {
+	case events.CommandSubmitPayment:
+		return a.handleSubmitPayment(ctx, env)
+	case events.CommandCheckPaymentStatus:
+		return a.handleCheckStatus(ctx, env)
+	case events.CommandRefundPayment:
+		return a.handleRefundPayment(ctx, env)
+	default:
+		return nil
+	}
+}
+
+// HandleWebhook validates HMAC signature, deduplicates by provider_event_id, and
+// publishes the normalized gateway outcome event. If publishing fails, the webhook
+// deduplication mark is reverted so the provider's retry is processed cleanly.
+func (a *Adapter) HandleWebhook(ctx context.Context, signature string, body []byte) error {
+	if strings.TrimSpace(a.webhookSecret) == "" {
+		return ErrWebhookSecretNotConfigured
+	}
+	if !VerifyWebhook(a.webhookSecret, body, signature) {
+		return ErrInvalidWebhookSignature
+	}
+
+	var webhook WebhookPayload
+	if err := json.Unmarshal(body, &webhook); err != nil {
+		return fmt.Errorf("unmarshal webhook payload: %w", err)
+	}
+	if webhook.ProviderEventID == "" || webhook.PaymentID == "" {
+		return fmt.Errorf("provider_event_id and payment_id are required")
+	}
+
+	a.webhookMu.Lock()
+	if _, duplicate := a.seenWebhooks[webhook.ProviderEventID]; duplicate {
+		a.webhookMu.Unlock()
+		return nil
+	}
+	a.seenWebhooks[webhook.ProviderEventID] = struct{}{}
+	a.webhookMu.Unlock()
+
+	ctx = ports.WithCorrelation(ctx, webhook.PaymentID, webhook.PaymentID, "")
+	meta := events.Metadata{
+		CorrelationID: webhook.PaymentID,
+		CausationID:   webhook.ProviderEventID,
+	}
+
+	var emitErr error
+	switch webhook.Status {
+	case string(ports.GatewayOutcomeApproved):
+		emitErr = a.emit(ctx, events.EventGatewayPaymentApproved, webhook.PaymentID, events.GatewayPaymentApprovedPayload{
+			PaymentID:   webhook.PaymentID,
+			Provider:    webhook.Provider,
+			ProviderRef: webhook.ProviderRef,
+		}, meta)
+
+	case string(ports.GatewayOutcomeDeclined):
+		reason := webhook.Reason
+		if reason == "" {
+			reason = events.ReasonGatewayDeclined
+		}
+		emitErr = a.emit(ctx, events.EventGatewayPaymentDeclined, webhook.PaymentID, events.GatewayPaymentDeclinedPayload{
+			PaymentID: webhook.PaymentID,
+			Provider:  webhook.Provider,
+			Reason:    reason,
+		}, meta)
+
+	default:
+		emitErr = fmt.Errorf("unsupported webhook status: %s", webhook.Status)
+	}
+
+	if emitErr != nil {
+		a.webhookMu.Lock()
+		delete(a.seenWebhooks, webhook.ProviderEventID)
+		a.webhookMu.Unlock()
+	}
+	return emitErr
+}
+
+func (a *Adapter) handleSubmitPayment(ctx context.Context, env events.Envelope) error {
+	cmd, err := events.DecodePayload[events.SubmitPaymentCommand](env)
+	if err != nil {
+		return ports.NonRetryable(err)
+	}
+	// A recovery resubmission or a payment already attempted by this adapter may have reached
+	// the provider, so blocking it locally must never be reported as certain non-delivery.
+	possiblySent := cmd.Resubmission || a.paymentWasAttempted(cmd.PaymentID)
+	ctx = ports.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, "")
+	meta := events.Metadata{
+		CorrelationID: cmd.PaymentID,
+		CausationID:   env.EventID,
+	}
+
+	// Non-blocking bulkhead acquisition: if saturated, the request was never sent.
+	select {
+	case a.bulkhead <- struct{}{}:
+		defer func() { <-a.bulkhead }()
+	default:
+		if possiblySent {
+			return a.emit(ctx, events.EventGatewayOutcomeUnknown, cmd.PaymentID, events.GatewayOutcomeUnknownPayload{
+				PaymentID: cmd.PaymentID,
+				Provider:  cmd.Provider,
+				Reason:    "BULKHEAD_SATURATED",
+			}, meta)
+		}
+		return a.emit(ctx, events.EventGatewaySubmissionNotSent, cmd.PaymentID, events.GatewaySubmissionNotSentPayload{
+			PaymentID: cmd.PaymentID,
+			Provider:  cmd.Provider,
+			Reason:    "BULKHEAD_SATURATED",
+		}, meta)
+	}
+
+	sentAnyAttempt := false
+	var lastErr error
+
+	for attempt := 0; attempt < a.retry.MaxAttempts; attempt++ {
+		if err := a.breaker.Allow(); err != nil {
+			if !sentAnyAttempt && !possiblySent {
+				// Certainty of non-delivery (never sent in this or any previous delivery): safe to release funds.
+				return a.emit(ctx, events.EventGatewaySubmissionNotSent, cmd.PaymentID, events.GatewaySubmissionNotSentPayload{
+					PaymentID: cmd.PaymentID,
+					Provider:  cmd.Provider,
+					Reason:    events.ReasonCircuitOpen,
+				}, meta)
+			}
+			// A prior attempt already went over the wire: never emit NotSent because the provider may have processed it.
+			return a.emit(ctx, events.EventGatewayOutcomeUnknown, cmd.PaymentID, events.GatewayOutcomeUnknownPayload{
+				PaymentID: cmd.PaymentID,
+				Provider:  cmd.Provider,
+				Reason:    events.ReasonGatewayTimeout,
+			}, meta)
+		}
+
+		sentAnyAttempt = true
+		a.markPaymentAttempted(cmd.PaymentID)
+		start := time.Now()
+		attemptCtx, cancel := context.WithTimeout(ctx, a.retry.AttemptTimeout)
+		result, callErr := a.gatewayClient.SubmitPayment(attemptCtx, ports.GatewaySubmitRequest{
+			PaymentID: cmd.PaymentID,
+			Provider:  cmd.Provider,
+			ServiceID: cmd.ServiceID,
+			Amount:    cmd.Amount,
+		})
+		cancel()
+		elapsed := time.Since(start)
+
+		if callErr == nil {
+			a.breaker.RecordSuccess()
+			a.recordAttempt(cmd.Provider, string(result.Outcome), elapsed)
+			return a.emitSubmitOutcome(ctx, cmd, result, meta)
+		}
+
+		lastErr = callErr
+		isTimeout := errors.Is(callErr, ports.ErrGatewayTimeout) || errors.Is(callErr, context.DeadlineExceeded)
+		a.breaker.RecordFailure(isTimeout)
+		a.recordAttempt(cmd.Provider, "ERROR", elapsed)
+
+		ports.LoggerFromContext(ctx, a.logger).Warn("gateway submit attempt failed",
+			"provider", cmd.Provider,
+			"attempt", attempt+1,
+			"max_attempts", a.retry.MaxAttempts,
+			"error", callErr.Error(),
+		)
+
+		if attempt+1 < a.retry.MaxAttempts {
+			delay := FullJitterDelay(attempt, a.retry.BaseDelay, a.retry.MaxDelay, a.retry.RandFloat)
+			if sleepErr := a.retry.Sleep(ctx, delay); sleepErr != nil {
+				break
+			}
+		}
+	}
+
+	reason := events.ReasonGatewayTimeout
+	if lastErr != nil && !errors.Is(lastErr, ports.ErrGatewayTimeout) && !errors.Is(lastErr, context.DeadlineExceeded) {
+		reason = lastErr.Error()
+	}
+	return a.emit(ctx, events.EventGatewayOutcomeUnknown, cmd.PaymentID, events.GatewayOutcomeUnknownPayload{
+		PaymentID: cmd.PaymentID,
+		Provider:  cmd.Provider,
+		Reason:    reason,
+	}, meta)
+}
+
+func (a *Adapter) emitSubmitOutcome(
+	ctx context.Context,
+	cmd events.SubmitPaymentCommand,
+	result ports.GatewaySubmitResult,
+	meta events.Metadata,
+) error {
+	switch result.Outcome {
+	case ports.GatewayOutcomeAccepted:
+		return a.emit(ctx, events.EventGatewaySubmissionAccepted, cmd.PaymentID, events.GatewaySubmissionAcceptedPayload{
+			PaymentID:   cmd.PaymentID,
+			Provider:    cmd.Provider,
+			ProviderRef: result.ProviderRef,
+		}, meta)
+
+	case ports.GatewayOutcomeApproved:
+		return a.emit(ctx, events.EventGatewayPaymentApproved, cmd.PaymentID, events.GatewayPaymentApprovedPayload{
+			PaymentID:   cmd.PaymentID,
+			Provider:    cmd.Provider,
+			ProviderRef: result.ProviderRef,
+		}, meta)
+
+	case ports.GatewayOutcomeDeclined:
+		reason := result.Reason
+		if reason == "" {
+			reason = events.ReasonGatewayDeclined
+		}
+		return a.emit(ctx, events.EventGatewayPaymentDeclined, cmd.PaymentID, events.GatewayPaymentDeclinedPayload{
+			PaymentID: cmd.PaymentID,
+			Provider:  cmd.Provider,
+			Reason:    reason,
+		}, meta)
+
+	default:
+		return a.emit(ctx, events.EventGatewayOutcomeUnknown, cmd.PaymentID, events.GatewayOutcomeUnknownPayload{
+			PaymentID: cmd.PaymentID,
+			Provider:  cmd.Provider,
+			Reason:    fmt.Sprintf("unexpected gateway outcome: %s", result.Outcome),
+		}, meta)
+	}
+}
+
+func (a *Adapter) handleCheckStatus(ctx context.Context, env events.Envelope) error {
+	cmd, err := events.DecodePayload[events.CheckPaymentStatusCommand](env)
+	if err != nil {
+		return ports.NonRetryable(err)
+	}
+	ctx = ports.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, "")
+	meta := events.Metadata{
+		CorrelationID: cmd.PaymentID,
+		CausationID:   env.EventID,
+	}
+
+	attemptCtx, cancel := context.WithTimeout(ctx, a.retry.AttemptTimeout)
+	result, err := a.gatewayClient.CheckStatus(attemptCtx, cmd.PaymentID, cmd.Provider)
+	cancel()
+
+	if err != nil {
+		return a.emit(ctx, events.EventGatewayStatusPending, cmd.PaymentID, events.GatewayStatusPendingPayload{
+			PaymentID: cmd.PaymentID,
+			Provider:  cmd.Provider,
+		}, meta)
+	}
+
+	switch result.Outcome {
+	case ports.GatewayOutcomeApproved:
+		return a.emit(ctx, events.EventGatewayPaymentApproved, cmd.PaymentID, events.GatewayPaymentApprovedPayload{
+			PaymentID:   cmd.PaymentID,
+			Provider:    cmd.Provider,
+			ProviderRef: result.ProviderRef,
+		}, meta)
+
+	case ports.GatewayOutcomeDeclined, ports.GatewayOutcomeNotFound:
+		reason := result.Reason
+		if reason == "" {
+			reason = string(result.Outcome)
+		}
+		return a.emit(ctx, events.EventGatewayPaymentDeclined, cmd.PaymentID, events.GatewayPaymentDeclinedPayload{
+			PaymentID: cmd.PaymentID,
+			Provider:  cmd.Provider,
+			Reason:    reason,
+		}, meta)
+
+	default:
+		return a.emit(ctx, events.EventGatewayStatusPending, cmd.PaymentID, events.GatewayStatusPendingPayload{
+			PaymentID: cmd.PaymentID,
+			Provider:  cmd.Provider,
+		}, meta)
+	}
+}
+
+func (a *Adapter) handleRefundPayment(ctx context.Context, env events.Envelope) error {
+	cmd, err := events.DecodePayload[events.RefundPaymentCommand](env)
+	if err != nil {
+		return ports.NonRetryable(err)
+	}
+	ctx = ports.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, "")
+	meta := events.Metadata{
+		CorrelationID: cmd.PaymentID,
+		CausationID:   env.EventID,
+	}
+
+	// Only an explicit provider rejection releases the in-flight refund reservation. Saturation,
+	// an open breaker, or a previous uncertain attempt return retryable errors instead.
+	select {
+	case a.bulkhead <- struct{}{}:
+		defer func() { <-a.bulkhead }()
+	default:
+		return fmt.Errorf("refund %s not sent: bulkhead saturated (previously_attempted=%t)",
+			cmd.RefundID, a.refundWasAttempted(cmd.RefundID))
+	}
+
+	var lastErr error
+
+	for attempt := 0; attempt < a.retry.MaxAttempts; attempt++ {
+		if err := a.breaker.Allow(); err != nil {
+			return fmt.Errorf("refund %s blocked by open circuit (previously_attempted=%t): %w",
+				cmd.RefundID, a.refundWasAttempted(cmd.RefundID), err)
+		}
+
+		a.markRefundAttempted(cmd.RefundID)
+		start := time.Now()
+		attemptCtx, cancel := context.WithTimeout(ctx, a.retry.AttemptTimeout)
+		result, callErr := a.gatewayClient.RefundPayment(attemptCtx, ports.GatewayRefundRequest{
+			PaymentID:   cmd.PaymentID,
+			RefundID:    cmd.RefundID,
+			Provider:    cmd.Provider,
+			ProviderRef: cmd.ProviderRef,
+			Amount:      cmd.Amount,
+		})
+		cancel()
+		elapsed := time.Since(start)
+
+		if callErr == nil {
+			a.breaker.RecordSuccess()
+			if result.Approved {
+				a.recordAttempt(cmd.Provider, "REFUND_APPROVED", elapsed)
+				return a.emit(ctx, events.EventGatewayRefundApproved, cmd.PaymentID, events.GatewayRefundApprovedPayload{
+					PaymentID:   cmd.PaymentID,
+					RefundID:    cmd.RefundID,
+					Provider:    cmd.Provider,
+					ProviderRef: result.ProviderRef,
+					Amount:      cmd.Amount,
+				}, meta)
+			}
+
+			a.recordAttempt(cmd.Provider, "REFUND_DECLINED", elapsed)
+			reason := result.Reason
+			if reason == "" {
+				reason = "REFUND_DECLINED"
+			}
+			return a.emit(ctx, events.EventGatewayRefundDeclined, cmd.PaymentID, events.GatewayRefundDeclinedPayload{
+				PaymentID: cmd.PaymentID,
+				RefundID:  cmd.RefundID,
+				Provider:  cmd.Provider,
+				Reason:    reason,
+			}, meta)
+		}
+
+		lastErr = callErr
+		isTimeout := errors.Is(callErr, ports.ErrGatewayTimeout) || errors.Is(callErr, context.DeadlineExceeded)
+		a.breaker.RecordFailure(isTimeout)
+		a.recordAttempt(cmd.Provider, "REFUND_ERROR", elapsed)
+
+		ports.LoggerFromContext(ctx, a.logger).Warn("gateway refund attempt failed",
+			"provider", cmd.Provider,
+			"refund_id", cmd.RefundID,
+			"attempt", attempt+1,
+			"max_attempts", a.retry.MaxAttempts,
+			"error", callErr.Error(),
+		)
+
+		if attempt+1 < a.retry.MaxAttempts {
+			delay := FullJitterDelay(attempt, a.retry.BaseDelay, a.retry.MaxDelay, a.retry.RandFloat)
+			if sleepErr := a.retry.Sleep(ctx, delay); sleepErr != nil {
+				break
+			}
+		}
+	}
+
+	// Never convert a timeout or transient transport failure into a definitive GatewayRefundDeclined.
+	return fmt.Errorf("refund %s outcome uncertain after %d attempts: %w", cmd.RefundID, a.retry.MaxAttempts, lastErr)
+}
+
+func (a *Adapter) emit(ctx context.Context, eventType, paymentID string, payload any, meta events.Metadata) error {
+	env, err := events.NewEnvelope(
+		eventType,
+		events.AggregateTypeGateway,
+		paymentID,
+		0,
+		payload,
+		meta,
+		a.clock,
+		a.idGen,
+	)
+	if err != nil {
+		return err
+	}
+	return a.publisher.Publish(ctx, events.TopicGatewayEvents, paymentID, env)
+}
+
+func (a *Adapter) recordAttempt(provider, outcome string, elapsed time.Duration) {
+	if a.metrics != nil {
+		a.metrics.RecordGatewayAttempt(provider, outcome, elapsed)
+	}
+}
+
+func (a *Adapter) markPaymentAttempted(paymentID string) {
+	a.attemptMu.Lock()
+	a.attemptedPayments[paymentID] = struct{}{}
+	a.attemptMu.Unlock()
+}
+
+func (a *Adapter) paymentWasAttempted(paymentID string) bool {
+	a.attemptMu.Lock()
+	defer a.attemptMu.Unlock()
+	_, attempted := a.attemptedPayments[paymentID]
+	return attempted
+}
+
+func (a *Adapter) markRefundAttempted(refundID string) {
+	a.attemptMu.Lock()
+	a.attemptedRefunds[refundID] = struct{}{}
+	a.attemptMu.Unlock()
+}
+
+func (a *Adapter) refundWasAttempted(refundID string) bool {
+	a.attemptMu.Lock()
+	defer a.attemptMu.Unlock()
+	_, attempted := a.attemptedRefunds[refundID]
+	return attempted
+}
