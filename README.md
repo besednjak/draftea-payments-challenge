@@ -104,6 +104,10 @@ La Parte 2 se acotó conscientemente al alcance de ~4 horas. Las invariantes fin
 | Recuperación de todos los consumidores por offset | Recovery enfocado en pagos: `RebuildAll` de read models + `RecoverActiveSagas` sobre streams `payment-*` (re-emite `SubmitPayment` con `Resubmission=true`, que nunca se reporta como `NotSent`) |
 | Conciliación de reembolsos inciertos con el proveedor | Un reembolso con timeout o breaker abierto mantiene el monto reservado en `Payment` y su comando queda en la DLQ para *redrive* manual; `RecoverActiveSagas` **no** retoma reembolsos |
 | Tablas `gateway_attempts` / `gateway_webhooks` en PostgreSQL | `attemptedPayments`, `attemptedRefunds` y `seenWebhooks` del Gateway Adapter viven en memoria y se pierden al reiniciar (por eso la recovery marca `Resubmission=true`) |
+| Contratos/schemas versionados por servicio | *Shared kernel* en `internal/domain/events` para evitar mapeo repetitivo en el alcance de 4 horas (`wallet` y `payment` siguen sin importarse entre sí) |
+| Un circuit breaker por proveedor externo | Instancia única de `CircuitBreaker` en la simulación (el diseño soporta un mapa por `provider` detrás del mismo puerto) |
+| Estado intermedio `ReleaseRequested` ante carrera `Declined` vs `Approved` | La carrera se resuelve atómicamente en el aggregate `Wallet` (una reserva capturada no puede liberarse y viceversa), evitando un estado extra |
+| Tablas de deduplicación con TTL/retención | Mapas en memoria sin cota (`InboxStore`, `seenEvents`, `seenWebhooks`, `attempted*`) suficientes para tests y demo |
 
 ### Escenarios del enunciado → tests
 

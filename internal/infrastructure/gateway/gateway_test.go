@@ -283,6 +283,19 @@ func TestAdapterWebhookHMACDeduplicationAndRollback(t *testing.T) {
 	}
 	validSignature := gateway.SignWebhook(secret, webhookBody)
 
+	t.Run("fails closed when webhook secret is not configured", func(t *testing.T) {
+		adapter := gateway.NewAdapter(gateway.AdapterConfig{
+			Gateway:   gateway.NewMockGateway(gateway.MockBehavior{}),
+			Publisher: &capturePublisher{},
+		})
+
+		err := adapter.HandleWebhook(context.Background(), validSignature, webhookBody)
+
+		if !errors.Is(err, gateway.ErrWebhookSecretNotConfigured) {
+			t.Fatalf("expected ErrWebhookSecretNotConfigured, got %v", err)
+		}
+	})
+
 	t.Run("rejects invalid HMAC signature", func(t *testing.T) {
 		adapter := gateway.NewAdapter(gateway.AdapterConfig{
 			Gateway:       gateway.NewMockGateway(gateway.MockBehavior{}),

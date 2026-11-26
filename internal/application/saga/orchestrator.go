@@ -143,6 +143,12 @@ func NewPaymentOrchestrator(cfg Config) *PaymentOrchestrator {
 // and waits up to SyncReserveWait (default 2s) to return an immediate 422 on insufficient funds
 // or 202 Accepted with the updated available balance.
 func (o *PaymentOrchestrator) InitiatePayment(ctx context.Context, req InitiatePaymentRequest) (InitiatePaymentResult, error) {
+	req.IdempotencyKey = strings.TrimSpace(req.IdempotencyKey)
+	req.PaymentID = strings.TrimSpace(req.PaymentID)
+	if req.IdempotencyKey == "" && req.PaymentID == "" {
+		return InitiatePaymentResult{}, fmt.Errorf("%w: either payment_id or idempotency_key is required", payment.ErrInvalidPaymentID)
+	}
+
 	requestHash := hashInitiateRequest(req)
 	idempotencyReserved := false
 
@@ -225,7 +231,7 @@ func (o *PaymentOrchestrator) InitiatePayment(ctx context.Context, req InitiateP
 		}
 	}
 
-	if err := o.publishPaymentEvents(ctx, initiated.ID(), uncommitted); err != nil {
+	if err := o.publishPaymentEvents(cleanupCtx, initiated.ID(), uncommitted); err != nil {
 		// PaymentInitiated is already durable: answer exactly like a retry would (202 PENDING)
 		// and let RecoverActiveSagas resume the saga instead of failing an existing payment.
 		ports.LoggerFromContext(ctx, o.logger).Warn("payment persisted but publish failed; recovery will resume it",
@@ -239,7 +245,7 @@ func (o *PaymentOrchestrator) InitiatePayment(ctx context.Context, req InitiateP
 	defer o.unregisterWaiter(initiated.ID())
 
 	if err := o.publishCommand(
-		ctx,
+		cleanupCtx,
 		events.TopicWalletsCommands,
 		initiated.WalletID(),
 		events.CommandReserveFunds,
@@ -250,6 +256,7 @@ func (o *PaymentOrchestrator) InitiatePayment(ctx context.Context, req InitiateP
 		events.ReserveFundsCommand{
 			PaymentID: initiated.ID(),
 			WalletID:  initiated.WalletID(),
+			UserID:    initiated.UserID(),
 			Amount:    initiated.Amount(),
 		},
 	); err != nil {
@@ -379,10 +386,11 @@ func (o *PaymentOrchestrator) HandleWalletEvent(ctx context.Context, env events.
 				updated.ID(),
 				env.EventID,
 				events.SubmitPaymentCommand{
-					PaymentID: updated.ID(),
-					Provider:  updated.Provider(),
-					ServiceID: updated.ServiceID(),
-					Amount:    updated.Amount(),
+					PaymentID:    updated.ID(),
+					Provider:     updated.Provider(),
+					ServiceID:    updated.ServiceID(),
+					Amount:       updated.Amount(),
+					Resubmission: !transitioned,
 				},
 			)
 		}
@@ -553,7 +561,7 @@ func (o *PaymentOrchestrator) HandleGatewayEvent(ctx context.Context, env events
 		ctx = ports.WithCorrelation(ctx, payload.PaymentID, payload.PaymentID, "")
 		meta := events.Metadata{CorrelationID: payload.PaymentID, CausationID: env.EventID}
 		updated, transitioned, err := o.mutatePayment(ctx, payload.PaymentID, func(p *payment.Payment) error {
-			if p.Status() == payment.StatusGatewayUnknown || p.Status() == payment.StatusCompleted || p.Status().IsTerminal() {
+			if p.Status() == payment.StatusGatewayUnknown || p.Status() == payment.StatusManualReview || p.Status() == payment.StatusCompleted || p.Status().IsTerminal() {
 				return nil
 			}
 			return p.MarkGatewayUnknown(payload.Reason, meta)
@@ -574,6 +582,9 @@ func (o *PaymentOrchestrator) HandleGatewayEvent(ctx context.Context, env events
 		loaded, err := o.Load(ctx, payload.PaymentID)
 		if err != nil {
 			return err
+		}
+		if loaded.Status() == payment.StatusFailed {
+			return ports.NonRetryable(fmt.Errorf("contradictory gateway approval for failed payment %s", loaded.ID()))
 		}
 		if loaded.Status().IsTerminal() || loaded.Status() == payment.StatusCompleted {
 			return nil
@@ -609,7 +620,30 @@ func (o *PaymentOrchestrator) HandleGatewayEvent(ctx context.Context, env events
 		if err != nil {
 			return err
 		}
-		if loaded.Status().IsTerminal() || loaded.Status() == payment.StatusCompleted {
+		if loaded.Status() == payment.StatusCompleted || loaded.Status() == payment.StatusRefunded {
+			return ports.NonRetryable(fmt.Errorf("contradictory gateway decline for %s payment %s", loaded.Status(), loaded.ID()))
+		}
+		if loaded.Status().IsTerminal() {
+			return nil
+		}
+		// If the provider previously acknowledged the payment with a provider_ref, a NOT_FOUND
+		// during status check is contradictory (e.g., eventual consistency at provider): keep
+		// funds held in GATEWAY_UNKNOWN for reconciliation/manual review instead of releasing.
+		if loaded.ProviderRef() != "" && payload.Reason == string(ports.GatewayOutcomeNotFound) {
+			ctx = ports.WithCorrelation(ctx, loaded.ID(), loaded.ID(), loaded.WalletID())
+			ports.LoggerFromContext(ctx, o.logger).Warn("contradictory NOT_FOUND for payment with provider_ref; keeping funds held",
+				"provider_ref", loaded.ProviderRef(),
+			)
+			if loaded.Status() != payment.StatusGatewayUnknown && loaded.Status() != payment.StatusManualReview {
+				meta := events.Metadata{CorrelationID: loaded.ID(), CausationID: env.EventID}
+				_, _, err := o.mutatePayment(ctx, loaded.ID(), func(p *payment.Payment) error {
+					if p.Status() == payment.StatusGatewayUnknown || p.Status() == payment.StatusManualReview || p.Status() == payment.StatusCompleted || p.Status().IsTerminal() {
+						return nil
+					}
+					return p.MarkGatewayUnknown("NOT_FOUND_WITH_PROVIDER_REF", meta)
+				})
+				return wrapPermanentDomainError(err)
+			}
 			return nil
 		}
 		ctx = ports.WithCorrelation(ctx, loaded.ID(), loaded.ID(), loaded.WalletID())
@@ -848,11 +882,14 @@ func (o *PaymentOrchestrator) RecoverActiveSagas(ctx context.Context) (RecoveryS
 		return summary, err
 	}
 
+	var recoveryErrs []error
+
 	for _, streamID := range streamIDs {
 		paymentID := strings.TrimPrefix(streamID, prefix)
 		loaded, err := o.Load(ctx, paymentID)
 		if err != nil {
-			return summary, fmt.Errorf("rehydrate %s during recovery: %w", streamID, err)
+			recoveryErrs = append(recoveryErrs, fmt.Errorf("rehydrate %s during recovery: %w", streamID, err))
+			continue
 		}
 		summary.Scanned++
 
@@ -876,6 +913,7 @@ func (o *PaymentOrchestrator) RecoverActiveSagas(ctx context.Context) (RecoveryS
 				events.ReserveFundsCommand{
 					PaymentID: loaded.ID(),
 					WalletID:  loaded.WalletID(),
+					UserID:    loaded.UserID(),
 					Amount:    loaded.Amount(),
 				},
 			)
@@ -914,7 +952,8 @@ func (o *PaymentOrchestrator) RecoverActiveSagas(ctx context.Context) (RecoveryS
 			)
 		}
 		if err != nil {
-			return summary, err
+			recoveryErrs = append(recoveryErrs, fmt.Errorf("resume %s (%s): %w", loaded.ID(), loaded.Status(), err))
+			continue
 		}
 
 		summary.Resumed++
@@ -924,7 +963,7 @@ func (o *PaymentOrchestrator) RecoverActiveSagas(ctx context.Context) (RecoveryS
 		)
 	}
 
-	return summary, nil
+	return summary, errors.Join(recoveryErrs...)
 }
 
 func (o *PaymentOrchestrator) mutatePayment(
@@ -1101,8 +1140,21 @@ func (o *PaymentOrchestrator) notifyWaiter(paymentID string, outcome reserveOutc
 }
 
 func hashInitiateRequest(req InitiatePaymentRequest) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%s|%d|%s",
-		req.WalletID, req.ServiceID, req.Provider, req.Amount.Amount, strings.ToUpper(req.Amount.Currency))))
+	canonical := struct {
+		WalletID  string `json:"wallet_id"`
+		ServiceID string `json:"service_id"`
+		Provider  string `json:"provider"`
+		Amount    int64  `json:"amount"`
+		Currency  string `json:"currency"`
+	}{
+		WalletID:  strings.TrimSpace(req.WalletID),
+		ServiceID: strings.TrimSpace(req.ServiceID),
+		Provider:  strings.TrimSpace(req.Provider),
+		Amount:    req.Amount.Amount,
+		Currency:  strings.ToUpper(strings.TrimSpace(req.Amount.Currency)),
+	}
+	encoded, _ := json.Marshal(canonical)
+	sum := sha256.Sum256(encoded)
 	return hex.EncodeToString(sum[:])
 }
 

@@ -20,12 +20,13 @@ const (
 )
 
 const (
-	ReasonInsufficientFunds = "INSUFFICIENT_FUNDS"
-	ReasonCurrencyMismatch  = "CURRENCY_MISMATCH"
-	ReasonCircuitOpen       = "CIRCUIT_OPEN"
-	ReasonGatewayTimeout    = "GATEWAY_TIMEOUT"
-	ReasonGatewayDeclined   = "GATEWAY_DECLINED"
-	ReasonReconcileExpired  = "RECONCILIATION_WINDOW_EXPIRED"
+	ReasonInsufficientFunds  = "INSUFFICIENT_FUNDS"
+	ReasonCurrencyMismatch   = "CURRENCY_MISMATCH"
+	ReasonUnauthorizedWallet = "UNAUTHORIZED_WALLET"
+	ReasonCircuitOpen        = "CIRCUIT_OPEN"
+	ReasonGatewayTimeout     = "GATEWAY_TIMEOUT"
+	ReasonGatewayDeclined    = "GATEWAY_DECLINED"
+	ReasonReconcileExpired   = "RECONCILIATION_WINDOW_EXPIRED"
 )
 
 const (
@@ -76,6 +77,7 @@ const (
 type ReserveFundsCommand struct {
 	PaymentID string `json:"payment_id"`
 	WalletID  string `json:"wallet_id"`
+	UserID    string `json:"user_id,omitempty"`
 	Amount    Money  `json:"amount"`
 }
 

@@ -67,7 +67,7 @@ func TestWalletReserveAndCaptureHappyPath(t *testing.T) {
 	fundedWallet.ClearUncommitted()
 	meta := events.Metadata{CorrelationID: "pay_1"}
 
-	if err := fundedWallet.Reserve("pay_1", events.Money{Amount: 4000, Currency: "ARS"}, meta); err != nil {
+	if err := fundedWallet.Reserve("pay_1", "usr_1", events.Money{Amount: 4000, Currency: "ARS"}, meta); err != nil {
 		t.Fatalf("Reserve failed: %v", err)
 	}
 	if fundedWallet.Balance() != 10000 || fundedWallet.Held() != 4000 || fundedWallet.Available() != 6000 {
@@ -79,7 +79,7 @@ func TestWalletReserveAndCaptureHappyPath(t *testing.T) {
 			fundedWallet.BaseVersion(), fundedWallet.Version())
 	}
 
-	if err := fundedWallet.Reserve("pay_1", events.Money{Amount: 4000, Currency: "ARS"}, meta); err != nil {
+	if err := fundedWallet.Reserve("pay_1", "usr_1", events.Money{Amount: 4000, Currency: "ARS"}, meta); err != nil {
 		t.Fatalf("duplicate Reserve failed: %v", err)
 	}
 	if fundedWallet.Version() != 3 || fundedWallet.Held() != 4000 {
@@ -110,7 +110,7 @@ func TestWalletReserveRejections(t *testing.T) {
 		fundedWallet := mustCreateFundedWallet(t, 5000)
 		fundedWallet.ClearUncommitted()
 
-		err := fundedWallet.Reserve("pay_big", events.Money{Amount: 8000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_big"})
+		err := fundedWallet.Reserve("pay_big", "usr_1", events.Money{Amount: 8000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_big"})
 
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -136,7 +136,7 @@ func TestWalletReserveRejections(t *testing.T) {
 		fundedWallet := mustCreateFundedWallet(t, 5000)
 		fundedWallet.ClearUncommitted()
 
-		err := fundedWallet.Reserve("pay_usd", events.Money{Amount: 1000, Currency: "USD"}, events.Metadata{CorrelationID: "pay_usd"})
+		err := fundedWallet.Reserve("pay_usd", "usr_1", events.Money{Amount: 1000, Currency: "USD"}, events.Metadata{CorrelationID: "pay_usd"})
 
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -153,12 +153,34 @@ func TestWalletReserveRejections(t *testing.T) {
 			t.Fatalf("got reason=%q, want %q", rejection.Reason, events.ReasonCurrencyMismatch)
 		}
 	})
+
+	t.Run("unauthorized user emits FundsReservationRejected", func(t *testing.T) {
+		fundedWallet := mustCreateFundedWallet(t, 5000)
+		fundedWallet.ClearUncommitted()
+
+		err := fundedWallet.Reserve("pay_other", "usr_intruder", events.Money{Amount: 1000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_other"})
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		uncommitted := fundedWallet.UncommittedEvents()
+		if len(uncommitted) != 1 || uncommitted[0].Type != events.EventFundsReservationRejected {
+			t.Fatalf("expected FundsReservationRejected, got %+v", uncommitted)
+		}
+		rejection, err := events.DecodePayload[events.FundsReservationRejectedPayload](uncommitted[0])
+		if err != nil {
+			t.Fatalf("DecodePayload failed: %v", err)
+		}
+		if rejection.Reason != events.ReasonUnauthorizedWallet {
+			t.Fatalf("got reason=%q, want %q", rejection.Reason, events.ReasonUnauthorizedWallet)
+		}
+	})
 }
 
 func TestWalletReleaseAndIdempotency(t *testing.T) {
 	fundedWallet := mustCreateFundedWallet(t, 10000)
 	meta := events.Metadata{CorrelationID: "pay_rel"}
-	if err := fundedWallet.Reserve("pay_rel", events.Money{Amount: 3000, Currency: "ARS"}, meta); err != nil {
+	if err := fundedWallet.Reserve("pay_rel", "usr_1", events.Money{Amount: 3000, Currency: "ARS"}, meta); err != nil {
 		t.Fatalf("Reserve failed: %v", err)
 	}
 
@@ -190,7 +212,7 @@ func TestWalletCaptureErrorsAndCannotReleaseCaptured(t *testing.T) {
 	if err := fundedWallet.Capture("pay_missing", "", events.Money{Amount: 100, Currency: "ARS"}, meta); !errors.Is(err, wallet.ErrReservationNotFound) {
 		t.Fatalf("got %v, want ErrReservationNotFound", err)
 	}
-	if err := fundedWallet.Reserve("pay_1", events.Money{Amount: 2000, Currency: "ARS"}, meta); err != nil {
+	if err := fundedWallet.Reserve("pay_1", "usr_1", events.Money{Amount: 2000, Currency: "ARS"}, meta); err != nil {
 		t.Fatalf("Reserve failed: %v", err)
 	}
 	if err := fundedWallet.Capture("pay_1", "", events.Money{Amount: 1500, Currency: "ARS"}, meta); !errors.Is(err, wallet.ErrCaptureAmountMismatch) {
@@ -225,7 +247,7 @@ func TestWalletRefundInvariantsAndDepositIdempotency(t *testing.T) {
 
 	// Capture 4000 so refunds up to 4000 are permitted.
 	meta := events.Metadata{CorrelationID: "pay_1"}
-	if err := fundedWallet.Reserve("pay_1", events.Money{Amount: 4000, Currency: "ARS"}, meta); err != nil {
+	if err := fundedWallet.Reserve("pay_1", "usr_1", events.Money{Amount: 4000, Currency: "ARS"}, meta); err != nil {
 		t.Fatalf("Reserve failed: %v", err)
 	}
 	if err := fundedWallet.Capture("pay_1", "prov_1", events.Money{Amount: 4000, Currency: "ARS"}, meta); err != nil {
@@ -272,7 +294,7 @@ func TestWalletDepositAndRefundOverflowProtection(t *testing.T) {
 
 func TestWalletRehydrateFromHistoryAndSnapshot(t *testing.T) {
 	fundedWallet := mustCreateFundedWallet(t, 10000)
-	if err := fundedWallet.Reserve("pay_1", events.Money{Amount: 3000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_1"}); err != nil {
+	if err := fundedWallet.Reserve("pay_1", "usr_1", events.Money{Amount: 3000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_1"}); err != nil {
 		t.Fatalf("Reserve pay_1 failed: %v", err)
 	}
 	snapshot := fundedWallet.TakeSnapshot()
@@ -287,7 +309,7 @@ func TestWalletRehydrateFromHistoryAndSnapshot(t *testing.T) {
 	if err := fundedWallet.Capture("pay_1", "prov_1", events.Money{Amount: 3000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_1"}); err != nil {
 		t.Fatalf("Capture failed: %v", err)
 	}
-	if err := fundedWallet.Reserve("pay_2", events.Money{Amount: 2000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_2"}); err != nil {
+	if err := fundedWallet.Reserve("pay_2", "usr_1", events.Money{Amount: 2000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_2"}); err != nil {
 		t.Fatalf("Reserve pay_2 failed: %v", err)
 	}
 	if err := fundedWallet.Refund("pay_1", "ref_1", events.Money{Amount: 500, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_1"}); err != nil {

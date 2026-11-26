@@ -222,7 +222,7 @@ func (s *Service) HandleCommand(ctx context.Context, env events.Envelope) (retEr
 		ctx = ports.WithCorrelation(ctx, cmd.PaymentID, cmd.PaymentID, cmd.WalletID)
 		meta := events.Metadata{CorrelationID: cmd.PaymentID, CausationID: env.EventID}
 		_, err = s.executeWithRetry(ctx, cmd.WalletID, func(w *domainwallet.Wallet) error {
-			return w.Reserve(cmd.PaymentID, cmd.Amount, meta)
+			return w.Reserve(cmd.PaymentID, cmd.UserID, cmd.Amount, meta)
 		}, matchReservationOutcomeEvent(cmd.PaymentID))
 		return wrapPermanentDomainError(err)
 
@@ -433,6 +433,7 @@ func wrapPermanentDomainError(err error) error {
 		domainwallet.ErrPaymentNotCaptured,
 		domainwallet.ErrRefundExceedsCaptured,
 		domainwallet.ErrAmountOverflow,
+		ports.ErrStreamNotFound,
 		events.ErrInvalidAmount,
 		events.ErrInvalidCurrency,
 	}

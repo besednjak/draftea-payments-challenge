@@ -2,6 +2,7 @@ package payment
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/besednjak/draftea-payments-challenge/internal/domain/events"
@@ -151,6 +152,12 @@ func newEmpty(opts ...Option) *Payment {
 
 // Initiate creates a new Payment aggregate in PENDING state and emits PaymentInitiated.
 func Initiate(params InitiateParams, meta events.Metadata, opts ...Option) (*Payment, error) {
+	params.PaymentID = strings.TrimSpace(params.PaymentID)
+	params.WalletID = strings.TrimSpace(params.WalletID)
+	params.UserID = strings.TrimSpace(params.UserID)
+	params.ServiceID = strings.TrimSpace(params.ServiceID)
+	params.Provider = strings.TrimSpace(params.Provider)
+
 	if params.PaymentID == "" {
 		return nil, ErrInvalidPaymentID
 	}

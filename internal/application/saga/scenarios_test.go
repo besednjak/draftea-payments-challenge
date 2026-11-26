@@ -41,6 +41,7 @@ type testSystem struct {
 	metrics          *observability.Collector
 	health           *observability.HealthRegistry
 	webhookSecret    string
+	expectDLQ        bool
 }
 
 func newTestSystem(
@@ -152,13 +153,7 @@ func newTestSystem(
 	health.Register(bus)
 	health.Register(mockGateway)
 
-	t.Cleanup(func() {
-		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = bus.Close(closeCtx)
-	})
-
-	return &testSystem{
+	sys := &testSystem{
 		store:            store,
 		snapshotStore:    snapshotStore,
 		inbox:            inbox,
@@ -176,6 +171,170 @@ func newTestSystem(
 		metrics:          metrics,
 		health:           health,
 		webhookSecret:    webhookSecret,
+	}
+
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = bus.Close(closeCtx)
+
+		if t.Failed() {
+			return
+		}
+		if !sys.expectDLQ {
+			assertAllDLQsEmpty(t, bus)
+		}
+		assertGlobalLedgerInvariants(t, store)
+	})
+
+	return sys
+}
+
+func assertAllDLQsEmpty(t *testing.T, bus *eventbus.PartitionedBus) {
+	t.Helper()
+	topics := []string{
+		events.TopicPaymentsEvents,
+		events.TopicWalletsCommands,
+		events.TopicWalletsEvents,
+		events.TopicGatewayCommands,
+		events.TopicGatewayEvents,
+	}
+	for _, topic := range topics {
+		if dlqs := bus.DeadLetters(topic); len(dlqs) > 0 {
+			t.Errorf("unexpected DLQ messages in %s: %+v", topic, dlqs)
+		}
+	}
+}
+
+func assertGlobalLedgerInvariants(t *testing.T, store *eventstore.InMemoryEventStore) {
+	t.Helper()
+
+	type walletLedger struct {
+		deposits     int64
+		captures     int64
+		refunds      int64
+		activeHolds  map[string]int64
+		capturedByID map[string]int64
+		refundedByID map[string]int64
+	}
+
+	allEvents, err := store.LoadAll(context.Background(), 0)
+	if err != nil {
+		t.Errorf("LoadAll for ledger invariant check failed: %v", err)
+		return
+	}
+
+	ledgers := make(map[string]*walletLedger)
+	paymentStreams := make(map[string][]events.Envelope)
+
+	ledgerFor := func(walletID string) *walletLedger {
+		entry, ok := ledgers[walletID]
+		if !ok {
+			entry = &walletLedger{
+				activeHolds:  make(map[string]int64),
+				capturedByID: make(map[string]int64),
+				refundedByID: make(map[string]int64),
+			}
+			ledgers[walletID] = entry
+		}
+		return entry
+	}
+
+	for _, stored := range allEvents {
+		env := stored.Envelope
+		switch env.AggregateType {
+		case events.AggregateTypeWallet:
+			entry := ledgerFor(env.AggregateID)
+			switch env.Type {
+			case events.EventFundsDeposited:
+				p, err := events.DecodePayload[events.FundsDepositedPayload](env)
+				if err != nil {
+					t.Errorf("decode FundsDeposited: %v", err)
+					return
+				}
+				entry.deposits += p.Amount.Amount
+			case events.EventFundsReserved:
+				p, err := events.DecodePayload[events.FundsReservedPayload](env)
+				if err != nil {
+					t.Errorf("decode FundsReserved: %v", err)
+					return
+				}
+				entry.activeHolds[p.PaymentID] = p.Amount.Amount
+			case events.EventFundsCaptured:
+				p, err := events.DecodePayload[events.FundsCapturedPayload](env)
+				if err != nil {
+					t.Errorf("decode FundsCaptured: %v", err)
+					return
+				}
+				delete(entry.activeHolds, p.PaymentID)
+				entry.captures += p.Amount.Amount
+				entry.capturedByID[p.PaymentID] += p.Amount.Amount
+			case events.EventFundsReleased:
+				p, err := events.DecodePayload[events.FundsReleasedPayload](env)
+				if err != nil {
+					t.Errorf("decode FundsReleased: %v", err)
+					return
+				}
+				delete(entry.activeHolds, p.PaymentID)
+			case events.EventFundsRefunded:
+				p, err := events.DecodePayload[events.FundsRefundedPayload](env)
+				if err != nil {
+					t.Errorf("decode FundsRefunded: %v", err)
+					return
+				}
+				entry.refunds += p.Amount.Amount
+				entry.refundedByID[p.PaymentID] += p.Amount.Amount
+			}
+
+		case events.AggregateTypePayment:
+			paymentStreams[env.AggregateID] = append(paymentStreams[env.AggregateID], env)
+		}
+	}
+
+	for walletID, entry := range ledgers {
+		expectedBalance := entry.deposits - entry.captures + entry.refunds
+		var expectedHeld int64
+		for _, holdAmount := range entry.activeHolds {
+			expectedHeld += holdAmount
+		}
+		expectedAvailable := expectedBalance - expectedHeld
+		if expectedBalance < 0 || expectedHeld < 0 || expectedAvailable < 0 {
+			t.Errorf("wallet %s negative invariant: balance=%d held=%d available=%d",
+				walletID, expectedBalance, expectedHeld, expectedAvailable)
+		}
+	}
+
+	for paymentID, history := range paymentStreams {
+		rebuilt, err := payment.Rehydrate(history)
+		if err != nil {
+			t.Errorf("rehydrate payment %s in ledger check failed: %v", paymentID, err)
+			continue
+		}
+		entry, exists := ledgers[rebuilt.WalletID()]
+		if !exists {
+			continue
+		}
+		switch rebuilt.Status() {
+		case payment.StatusCompleted, payment.StatusRefunded:
+			if entry.capturedByID[paymentID] != rebuilt.CapturedAmount() {
+				t.Errorf("payment %s (%s): wallet captured=%d != payment captured=%d",
+					paymentID, rebuilt.Status(), entry.capturedByID[paymentID], rebuilt.CapturedAmount())
+			}
+			if entry.refundedByID[paymentID] != rebuilt.RefundedTotal() {
+				t.Errorf("payment %s (%s): wallet refunded=%d != payment refunded=%d",
+					paymentID, rebuilt.Status(), entry.refundedByID[paymentID], rebuilt.RefundedTotal())
+			}
+			if _, stillHeld := entry.activeHolds[paymentID]; stillHeld {
+				t.Errorf("payment %s (%s): unexpected active hold remaining in wallet", paymentID, rebuilt.Status())
+			}
+		case payment.StatusFailed, payment.StatusRejected:
+			if _, stillHeld := entry.activeHolds[paymentID]; stillHeld {
+				t.Errorf("payment %s (%s): orphaned active hold in wallet", paymentID, rebuilt.Status())
+			}
+			if entry.capturedByID[paymentID] != 0 {
+				t.Errorf("payment %s (%s): unexpected capture=%d in wallet", paymentID, rebuilt.Status(), entry.capturedByID[paymentID])
+			}
+		}
 	}
 }
 
@@ -696,10 +855,24 @@ func TestScenario4_ConcurrentPaymentsNoDoubleSpend(t *testing.T) {
 	})
 
 	t.Run("direct concurrent WalletService contention triggers optimistic locking without negative balance", func(t *testing.T) {
-		sys := newTestSystem(t, gateway.MockBehavior{}, nil, nil)
+		sys := newTestSystem(t, gateway.MockBehavior{SubmitOutcome: ports.GatewayOutcomeAccepted}, nil, nil)
 		sys.mustCreateFundedWallet(t, "wal_ol", "usr_ol", 5000)
 
 		const concurrentCommands = 12
+		for idx := 0; idx < concurrentCommands; idx++ {
+			pid := fmt.Sprintf("pay_ol_%d", idx)
+			seeded, err := payment.Initiate(payment.InitiateParams{
+				PaymentID: pid, WalletID: "wal_ol", UserID: "usr_ol", ServiceID: "svc_1", Provider: "mockpay",
+				Amount: events.Money{Amount: 1000, Currency: "ARS"},
+			}, events.Metadata{})
+			if err != nil {
+				t.Fatalf("seed payment %s failed: %v", pid, err)
+			}
+			if err := sys.store.Append(ctx, seeded.StreamID(), 0, seeded.UncommittedEvents()...); err != nil {
+				t.Fatalf("append payment %s failed: %v", pid, err)
+			}
+		}
+
 		var (
 			wg      sync.WaitGroup
 			startCh = make(chan struct{})
@@ -718,6 +891,7 @@ func TestScenario4_ConcurrentPaymentsNoDoubleSpend(t *testing.T) {
 					events.ReserveFundsCommand{
 						PaymentID: fmt.Sprintf("pay_ol_%d", index),
 						WalletID:  "wal_ol",
+						UserID:    "usr_ol",
 						Amount:    events.Money{Amount: 1000, Currency: "ARS"},
 					},
 					events.Metadata{CorrelationID: fmt.Sprintf("pay_ol_%d", index)},
@@ -772,13 +946,13 @@ func TestScenario5_SystemRecoveryRebuildAndResumeActiveSagas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load wallet failed: %v", err)
 	}
-	if err := loadedWallet.Reserve("pay_stuck_pending", events.Money{Amount: 5000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_stuck_pending"}); err != nil {
+	if err := loadedWallet.Reserve("pay_stuck_pending", "usr_rec", events.Money{Amount: 5000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_stuck_pending"}); err != nil {
 		t.Fatalf("seed reserve pay_stuck_pending failed: %v", err)
 	}
-	if err := loadedWallet.Reserve("pay_stuck_reserved", events.Money{Amount: 15000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_stuck_reserved"}); err != nil {
+	if err := loadedWallet.Reserve("pay_stuck_reserved", "usr_rec", events.Money{Amount: 15000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_stuck_reserved"}); err != nil {
 		t.Fatalf("seed reserve pay_stuck_reserved failed: %v", err)
 	}
-	if err := loadedWallet.Reserve("pay_stuck_unknown", events.Money{Amount: 10000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_stuck_unknown"}); err != nil {
+	if err := loadedWallet.Reserve("pay_stuck_unknown", "usr_rec", events.Money{Amount: 10000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_stuck_unknown"}); err != nil {
 		t.Fatalf("seed reserve pay_stuck_unknown failed: %v", err)
 	}
 	if err := durableStore.Append(ctx, loadedWallet.StreamID(), loadedWallet.BaseVersion(), loadedWallet.UncommittedEvents()...); err != nil {
@@ -1313,6 +1487,7 @@ func TestRegressionRefundTimeoutThenOpenBreakerKeepsPendingRefund(t *testing.T) 
 		SubmitOutcome:       ports.GatewayOutcomeApproved,
 		RefundAlwaysTimeout: true,
 	}, nil, nil)
+	sys.expectDLQ = true
 	sys.mustCreateFundedWallet(t, "wal_c2", "usr_c2", 20000)
 	sys.mustInitiatePayment(t, saga.InitiatePaymentRequest{
 		PaymentID: "pay_c2", WalletID: "wal_c2", UserID: "usr_c2", ServiceID: "svc_1", Provider: "mockpay",
@@ -1415,7 +1590,7 @@ func TestRegressionLateReserveAfterRejectionLeavesNoOrphanHold(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Load wallet failed: %v", err)
 		}
-		if err := orphanWallet.Reserve("pay_m1b", events.Money{Amount: 3000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_m1b"}); err != nil {
+		if err := orphanWallet.Reserve("pay_m1b", "usr_m1b", events.Money{Amount: 3000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_m1b"}); err != nil {
 			t.Fatalf("seed orphan Reserve failed: %v", err)
 		}
 		orphanEvents := orphanWallet.UncommittedEvents()
@@ -1453,7 +1628,7 @@ func TestRegressionRecoveryResubmitWithOpenBreakerEndsGatewayUnknown(t *testing.
 	if err != nil {
 		t.Fatalf("Load wallet failed: %v", err)
 	}
-	if err := crashedWallet.Reserve("pay_res", events.Money{Amount: 6000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_res"}); err != nil {
+	if err := crashedWallet.Reserve("pay_res", "usr_res", events.Money{Amount: 6000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_res"}); err != nil {
 		t.Fatalf("seed Reserve failed: %v", err)
 	}
 	if err := durableStore.Append(ctx, crashedWallet.StreamID(), crashedWallet.BaseVersion(), crashedWallet.UncommittedEvents()...); err != nil {
@@ -1507,5 +1682,184 @@ func TestRegressionRecoveryResubmitWithOpenBreakerEndsGatewayUnknown(t *testing.
 	}
 	if loadedWallet.Held() != 6000 || loadedWallet.Available() != 4000 {
 		t.Fatalf("funds must stay held pending reconciliation, held=%d available=%d", loadedWallet.Held(), loadedWallet.Available())
+	}
+}
+
+func TestRegressionRedeliveryFundsReservedWithOpenBreakerEndsGatewayUnknown(t *testing.T) {
+	ctx := context.Background()
+	durableStore := eventstore.NewInMemoryEventStore()
+	durableSnapshots := eventstore.NewInMemorySnapshotStore()
+
+	// Seed a wallet hold and a payment already in FUNDS_RESERVED (simulating post-restart state).
+	boot1 := newTestSystem(t, gateway.MockBehavior{SubmitOutcome: ports.GatewayOutcomeApproved}, durableStore, durableSnapshots)
+	boot1.mustCreateFundedWallet(t, "wal_n1", "usr_n1", 10000)
+
+	w, err := boot1.walletService.Load(ctx, "wal_n1")
+	if err != nil {
+		t.Fatalf("Load wallet failed: %v", err)
+	}
+	if err := w.Reserve("pay_n1", "usr_n1", events.Money{Amount: 5000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_n1"}); err != nil {
+		t.Fatalf("Reserve failed: %v", err)
+	}
+	walletEvts := w.UncommittedEvents()
+	if err := durableStore.Append(ctx, w.StreamID(), w.BaseVersion(), walletEvts...); err != nil {
+		t.Fatalf("append wallet failed: %v", err)
+	}
+	pay, err := payment.Initiate(payment.InitiateParams{
+		PaymentID: "pay_n1", WalletID: "wal_n1", UserID: "usr_n1", ServiceID: "svc_1", Provider: "mockpay",
+		Amount: events.Money{Amount: 5000, Currency: "ARS"},
+	}, events.Metadata{})
+	if err != nil {
+		t.Fatalf("Initiate failed: %v", err)
+	}
+	if err := pay.MarkFundsReserved(5000, events.Metadata{}); err != nil {
+		t.Fatalf("MarkFundsReserved failed: %v", err)
+	}
+	if err := durableStore.Append(ctx, pay.StreamID(), 0, pay.UncommittedEvents()...); err != nil {
+		t.Fatalf("append payment failed: %v", err)
+	}
+	if err := boot1.bus.Close(ctx); err != nil {
+		t.Fatalf("close boot1 bus failed: %v", err)
+	}
+
+	// Boot #2: fresh adapter and fresh inbox with circuit breaker open receives a redelivered FundsReserved.
+	boot2 := newTestSystem(t, gateway.MockBehavior{SubmitOutcome: ports.GatewayOutcomeApproved}, durableStore, durableSnapshots)
+	for i := 0; i < 5; i++ {
+		boot2.breaker.RecordFailure(true)
+	}
+	if err := boot2.bus.Publish(ctx, events.TopicWalletsEvents, "wal_n1", walletEvts[0]); err != nil {
+		t.Fatalf("Publish redelivered FundsReserved failed: %v", err)
+	}
+	boot2.drain(t)
+
+	loaded, err := boot2.orchestrator.Load(ctx, "pay_n1")
+	if err != nil {
+		t.Fatalf("Load payment failed: %v", err)
+	}
+	if loaded.Status() != payment.StatusGatewayUnknown {
+		t.Fatalf("expected GATEWAY_UNKNOWN on redelivery with open breaker, got %s", loaded.Status())
+	}
+	loadedWallet, err := boot2.walletService.Load(ctx, "wal_n1")
+	if err != nil {
+		t.Fatalf("Load wallet failed: %v", err)
+	}
+	if loadedWallet.Held() != 5000 || loadedWallet.Available() != 5000 {
+		t.Fatalf("funds must remain held on uncertain redelivery, held=%d available=%d", loadedWallet.Held(), loadedWallet.Available())
+	}
+}
+
+func TestRegressionContradictoryGatewayEventsAndNotFoundWithProviderRef(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("NOT_FOUND with provider_ref keeps payment in GATEWAY_UNKNOWN with funds held", func(t *testing.T) {
+		sys := newTestSystem(t, gateway.MockBehavior{
+			SubmitOutcome: ports.GatewayOutcomeAccepted,
+			StatusOutcome: ports.GatewayOutcomeNotFound,
+		}, nil, nil)
+		sys.mustCreateFundedWallet(t, "wal_n3", "usr_n3", 10000)
+
+		sys.mustInitiatePayment(t, saga.InitiatePaymentRequest{
+			PaymentID: "pay_n3", WalletID: "wal_n3", UserID: "usr_n3", ServiceID: "svc_1", Provider: "mockpay",
+			Amount: events.Money{Amount: 6000, Currency: "ARS"},
+		})
+		sys.drain(t)
+
+		if err := sys.orchestrator.TriggerReconciliation(ctx, "pay_n3"); err != nil {
+			t.Fatalf("TriggerReconciliation failed: %v", err)
+		}
+		sys.drain(t)
+
+		loaded, err := sys.orchestrator.Load(ctx, "pay_n3")
+		if err != nil {
+			t.Fatalf("Load payment failed: %v", err)
+		}
+		if loaded.Status() != payment.StatusGatewayUnknown || loaded.ProviderRef() == "" {
+			t.Fatalf("expected GATEWAY_UNKNOWN with provider_ref kept, got status=%s ref=%q", loaded.Status(), loaded.ProviderRef())
+		}
+		balance, err := sys.walletService.GetBalance(ctx, "wal_n3")
+		if err != nil || balance.Held != 6000 || balance.Available != 4000 {
+			t.Fatalf("funds must stay held when NOT_FOUND contradicts provider_ref, got %+v err=%v", balance, err)
+		}
+	})
+
+	t.Run("contradictory late APPROVED on FAILED and DECLINED on COMPLETED route directly to DLQ", func(t *testing.T) {
+		sys := newTestSystem(t, gateway.MockBehavior{SubmitOutcome: ports.GatewayOutcomeDeclined, DeclineReason: "CARD_DECLINED"}, nil, nil)
+		sys.expectDLQ = true
+		sys.mustCreateFundedWallet(t, "wal_n2", "usr_n2", 20000)
+
+		// Payment 1: declines and reaches FAILED.
+		sys.mustInitiatePayment(t, saga.InitiatePaymentRequest{
+			PaymentID: "pay_n2_failed", WalletID: "wal_n2", UserID: "usr_n2", ServiceID: "svc_1", Provider: "mockpay",
+			Amount: events.Money{Amount: 5000, Currency: "ARS"},
+		})
+		// Payment 2: approves and reaches COMPLETED.
+		sys.mockGateway.SetRule("pay_n2_completed", gateway.MockBehavior{SubmitOutcome: ports.GatewayOutcomeApproved})
+		sys.mustInitiatePayment(t, saga.InitiatePaymentRequest{
+			PaymentID: "pay_n2_completed", WalletID: "wal_n2", UserID: "usr_n2", ServiceID: "svc_1", Provider: "mockpay",
+			Amount: events.Money{Amount: 5000, Currency: "ARS"},
+		})
+		sys.drain(t)
+
+		// Deliver late contradictory events via HMAC webhooks.
+		sys.mustDeliverApprovedWebhook(t, "wh_late_approved", "pay_n2_failed", "prov_late_1")
+
+		declinedBody, err := json.Marshal(gateway.WebhookPayload{
+			ProviderEventID: "wh_late_declined",
+			PaymentID:       "pay_n2_completed",
+			Provider:        "mockpay",
+			Status:          string(ports.GatewayOutcomeDeclined),
+			Reason:          "LATE_REVERSAL",
+		})
+		if err != nil {
+			t.Fatalf("marshal declined webhook failed: %v", err)
+		}
+		if err := sys.gatewayAdapter.HandleWebhook(ctx, gateway.SignWebhook(sys.webhookSecret, declinedBody), declinedBody); err != nil {
+			t.Fatalf("HandleWebhook declined failed: %v", err)
+		}
+		sys.drain(t)
+
+		dlqs := sys.bus.DeadLetters(events.TopicGatewayEvents)
+		if len(dlqs) != 2 {
+			t.Fatalf("expected 2 contradictory events in gateway.events.v1.dlq, got %d (%+v)", len(dlqs), dlqs)
+		}
+		for _, entry := range dlqs {
+			if entry.Attempts != 1 {
+				t.Fatalf("contradictory event must be non-retryable (1 attempt), got %d for %s", entry.Attempts, entry.Envelope.AggregateID)
+			}
+		}
+
+		// Neither payment state nor wallet balance was corrupted.
+		failedView, _ := sys.orchestrator.GetPayment(ctx, "pay_n2_failed")
+		completedView, _ := sys.orchestrator.GetPayment(ctx, "pay_n2_completed")
+		if failedView.Status != string(payment.StatusFailed) || completedView.Status != string(payment.StatusCompleted) {
+			t.Fatalf("unexpected statuses: failed=%s completed=%s", failedView.Status, completedView.Status)
+		}
+	})
+}
+
+func TestRegressionUnauthorizedWalletOwnershipRejected(t *testing.T) {
+	ctx := context.Background()
+	sys := newTestSystem(t, gateway.MockBehavior{SubmitOutcome: ports.GatewayOutcomeApproved}, nil, nil)
+	sys.mustCreateFundedWallet(t, "wal_owner", "usr_alice", 10000)
+
+	result := sys.mustInitiatePayment(t, saga.InitiatePaymentRequest{
+		PaymentID: "pay_unauth",
+		WalletID:  "wal_owner",
+		UserID:    "usr_mallory",
+		ServiceID: "svc_1",
+		Provider:  "mockpay",
+		Amount:    events.Money{Amount: 2000, Currency: "ARS"},
+	})
+	sys.drain(t)
+
+	if result.HTTPStatus != http.StatusUnprocessableEntity || result.Status != payment.StatusRejected || result.Reason != events.ReasonUnauthorizedWallet {
+		t.Fatalf("expected 422 REJECTED UNAUTHORIZED_WALLET, got %+v", result)
+	}
+	if calls := sys.mockGateway.SubmitCalls("pay_unauth"); calls != 0 {
+		t.Fatalf("unauthorized payment must never contact gateway, got %d calls", calls)
+	}
+	balance, err := sys.walletService.GetBalance(ctx, "wal_owner")
+	if err != nil || balance.Balance != 10000 || balance.Held != 0 || balance.Available != 10000 {
+		t.Fatalf("wallet balance must remain untouched, got %+v err=%v", balance, err)
 	}
 }

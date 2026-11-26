@@ -24,7 +24,7 @@ func TestProjectorRebuildAllFromEventStore(t *testing.T) {
 	if err := userWallet.Deposit("dep_1", events.Money{Amount: 10000, Currency: "ARS"}, events.Metadata{}); err != nil {
 		t.Fatalf("Deposit failed: %v", err)
 	}
-	if err := userWallet.Reserve("pay_1", events.Money{Amount: 4000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_1"}); err != nil {
+	if err := userWallet.Reserve("pay_1", "usr_1", events.Money{Amount: 4000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_1"}); err != nil {
 		t.Fatalf("Reserve failed: %v", err)
 	}
 	if err := userWallet.Capture("pay_1", "prov_1", events.Money{Amount: 4000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_1"}); err != nil {

@@ -336,7 +336,7 @@ func runScenario5SystemRecovery(
 	fmt.Println("\n[5] Recuperación del Sistema tras Reinicio (Event Store Replay + Saga Recovery)")
 
 	carolWallet := mustValue(firstInstance.walletService.Load(ctx, "wal_carol"))
-	must(carolWallet.Reserve("pay_recovery_1", events.Money{Amount: 5000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_recovery_1"}))
+	must(carolWallet.Reserve("pay_recovery_1", "usr_carol", events.Money{Amount: 5000, Currency: "ARS"}, events.Metadata{CorrelationID: "pay_recovery_1"}))
 	must(firstInstance.store.Append(ctx, carolWallet.StreamID(), carolWallet.BaseVersion(), carolWallet.UncommittedEvents()...))
 
 	stuckPayment := mustValue(payment.Initiate(payment.InitiateParams{

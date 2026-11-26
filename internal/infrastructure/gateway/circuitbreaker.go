@@ -88,39 +88,56 @@ func (cb *CircuitBreaker) State() CircuitState {
 // Allow checks whether an outbound request is permitted to execute.
 // Returns ports.ErrCircuitOpen when the circuit is open or half-open probes are saturated.
 func (cb *CircuitBreaker) Allow() error {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
+	var (
+		changed bool
+		from    CircuitState
+		to      CircuitState
+		err     error
+	)
 
+	cb.mu.Lock()
 	switch cb.state {
 	case StateClosed:
-		return nil
+		err = nil
 
 	case StateOpen:
 		if cb.cfg.Clock().Sub(cb.openedAt) >= cb.cfg.OpenTimeout {
-			cb.transitionLocked(StateHalfOpen)
+			from, to, changed = cb.transitionLocked(StateHalfOpen)
 			cb.halfOpenSuccesses = 0
 			cb.halfOpenInFlight = 1
-			return nil
+			err = nil
+		} else {
+			err = ports.ErrCircuitOpen
 		}
-		return ports.ErrCircuitOpen
 
 	case StateHalfOpen:
 		if cb.halfOpenInFlight+cb.halfOpenSuccesses >= cb.cfg.HalfOpenMaxProbes {
-			return ports.ErrCircuitOpen
+			err = ports.ErrCircuitOpen
+		} else {
+			cb.halfOpenInFlight++
+			err = nil
 		}
-		cb.halfOpenInFlight++
-		return nil
 
 	default:
-		return ports.ErrCircuitOpen
+		err = ports.ErrCircuitOpen
 	}
+	cb.mu.Unlock()
+
+	if changed && cb.cfg.OnStateChange != nil {
+		cb.cfg.OnStateChange(cb.cfg.Provider, from, to)
+	}
+	return err
 }
 
 // RecordSuccess records a technically healthy response from the provider.
 func (cb *CircuitBreaker) RecordSuccess() {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
+	var (
+		changed bool
+		from    CircuitState
+		to      CircuitState
+	)
 
+	cb.mu.Lock()
 	cb.consecutiveTimeouts = 0
 
 	switch cb.state {
@@ -136,17 +153,26 @@ func (cb *CircuitBreaker) RecordSuccess() {
 			cb.resetWindowLocked()
 			cb.halfOpenInFlight = 0
 			cb.halfOpenSuccesses = 0
-			cb.transitionLocked(StateClosed)
+			from, to, changed = cb.transitionLocked(StateClosed)
 		}
+	}
+	cb.mu.Unlock()
+
+	if changed && cb.cfg.OnStateChange != nil {
+		cb.cfg.OnStateChange(cb.cfg.Provider, from, to)
 	}
 }
 
 // RecordFailure records a technical failure (timeout or 5xx/network error).
 // Business declines must NOT be recorded as circuit breaker failures.
 func (cb *CircuitBreaker) RecordFailure(isTimeout bool) {
-	cb.mu.Lock()
-	defer cb.mu.Unlock()
+	var (
+		changed bool
+		from    CircuitState
+		to      CircuitState
+	)
 
+	cb.mu.Lock()
 	if isTimeout {
 		cb.consecutiveTimeouts++
 	} else {
@@ -158,14 +184,19 @@ func (cb *CircuitBreaker) RecordFailure(isTimeout bool) {
 		cb.recordWindowLocked(true)
 		if cb.shouldOpenLocked() {
 			cb.openedAt = cb.cfg.Clock()
-			cb.transitionLocked(StateOpen)
+			from, to, changed = cb.transitionLocked(StateOpen)
 		}
 
 	case StateHalfOpen:
 		cb.halfOpenInFlight = 0
 		cb.halfOpenSuccesses = 0
 		cb.openedAt = cb.cfg.Clock()
-		cb.transitionLocked(StateOpen)
+		from, to, changed = cb.transitionLocked(StateOpen)
+	}
+	cb.mu.Unlock()
+
+	if changed && cb.cfg.OnStateChange != nil {
+		cb.cfg.OnStateChange(cb.cfg.Provider, from, to)
 	}
 }
 
@@ -202,13 +233,11 @@ func (cb *CircuitBreaker) shouldOpenLocked() bool {
 	return float64(failures)/float64(cb.windowCount) > cb.cfg.FailureRateThreshold
 }
 
-func (cb *CircuitBreaker) transitionLocked(to CircuitState) {
+func (cb *CircuitBreaker) transitionLocked(to CircuitState) (CircuitState, CircuitState, bool) {
 	if cb.state == to {
-		return
+		return cb.state, to, false
 	}
 	from := cb.state
 	cb.state = to
-	if cb.cfg.OnStateChange != nil {
-		cb.cfg.OnStateChange(cb.cfg.Provider, from, to)
-	}
+	return from, to, true
 }

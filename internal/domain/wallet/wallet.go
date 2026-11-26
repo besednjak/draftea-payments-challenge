@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"strings"
 
 	"github.com/besednjak/draftea-payments-challenge/internal/domain/events"
 )
@@ -93,6 +94,8 @@ func newEmpty(opts ...Option) *Wallet {
 
 // Create initializes a new Wallet aggregate and emits WalletCreated.
 func Create(walletID, userID, currency string, meta events.Metadata, opts ...Option) (*Wallet, error) {
+	walletID = strings.TrimSpace(walletID)
+	userID = strings.TrimSpace(userID)
 	if walletID == "" {
 		return nil, ErrInvalidWalletID
 	}
@@ -186,12 +189,12 @@ func (w *Wallet) Deposit(referenceID string, amount events.Money, meta events.Me
 }
 
 // Reserve places a hold for paymentID. It is idempotent per paymentID and emits
-// FundsReservationRejected when currency mismatches or available funds are insufficient.
-func (w *Wallet) Reserve(paymentID string, amount events.Money, meta events.Metadata) error {
+// FundsReservationRejected when ownership fails, currency mismatches, or available funds are insufficient.
+func (w *Wallet) Reserve(paymentID, userID string, amount events.Money, meta events.Metadata) error {
 	if !w.created {
 		return ErrWalletNotCreated
 	}
-	if paymentID == "" {
+	if strings.TrimSpace(paymentID) == "" {
 		return ErrInvalidPaymentID
 	}
 	money, err := events.NewMoney(amount.Amount, amount.Currency)
@@ -212,6 +215,16 @@ func (w *Wallet) Reserve(paymentID string, amount events.Money, meta events.Meta
 	// re-evaluate against a newer balance and create an orphaned hold.
 	if w.rejectedPayments[paymentID] {
 		return nil
+	}
+
+	if userID = strings.TrimSpace(userID); userID != "" && userID != w.userID {
+		payload := events.FundsReservationRejectedPayload{
+			PaymentID:        paymentID,
+			Amount:           money,
+			Reason:           events.ReasonUnauthorizedWallet,
+			AvailableBalance: w.Available(),
+		}
+		return w.record(events.EventFundsReservationRejected, w.id, payload, meta)
 	}
 
 	if money.Currency != w.currency {

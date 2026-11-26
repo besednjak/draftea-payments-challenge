@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +16,9 @@ import (
 )
 
 const gatewayConsumerName = "gateway-adapter"
+
+// ErrWebhookSecretNotConfigured is returned when HandleWebhook is called without a configured HMAC secret.
+var ErrWebhookSecretNotConfigured = errors.New("webhook HMAC secret is not configured")
 
 // WebhookPayload represents a normalized provider callback authenticated with HMAC.
 type WebhookPayload struct {
@@ -143,7 +147,10 @@ func (a *Adapter) HandleCommand(ctx context.Context, env events.Envelope) (retEr
 // publishes the normalized gateway outcome event. If publishing fails, the webhook
 // deduplication mark is reverted so the provider's retry is processed cleanly.
 func (a *Adapter) HandleWebhook(ctx context.Context, signature string, body []byte) error {
-	if a.webhookSecret != "" && !VerifyWebhook(a.webhookSecret, body, signature) {
+	if strings.TrimSpace(a.webhookSecret) == "" {
+		return ErrWebhookSecretNotConfigured
+	}
+	if !VerifyWebhook(a.webhookSecret, body, signature) {
 		return ErrInvalidWebhookSignature
 	}
 
